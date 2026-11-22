@@ -1,5 +1,5 @@
 <div align="center">
-<img src="jilespace-daozai/assets/windowisle-logo.png" width="112" alt="窗屿" />
+<img src="WindowIsle-r/assets/windowisle-logo.png" width="112" alt="窗屿" />
 
 # 窗屿 · WindowIsle
 
@@ -8,11 +8,11 @@
 Windows 桌面伙伴 · 音乐与歌词 · 邮件验证码 · 日程提醒 · AI 额度 · 系统状态 · 内存清理 · Agent 任务进度
 
 [![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D4)](#安装与更新)
-[![License](https://img.shields.io/badge/License-MIT-3cbf91)](jilespace-daozai/LICENSE)
+[![License](https://img.shields.io/badge/License-MIT-3cbf91)](WindowIsle-r/LICENSE)
 
 </div>
 
-![收起状态：贴在屏幕顶部的刘海](jilespace-daozai/docs/images/showcase-hero.png)
+![收起状态：贴在屏幕顶部的刘海](WindowIsle-r/docs/images/showcase-hero.png)
 
 ## 一个小岛，装下桌面上的小事
 
@@ -55,13 +55,13 @@ Windows 桌面伙伴 · 音乐与歌词 · 邮件验证码 · 日程提醒 · AI
 
 开始一段专注时间，在专注与休息之间切换；饮水面板记录当天进度，可以设置目标和提醒时段。
 
-![鼠标靠近后展开专注面板](jilespace-daozai/docs/images/showcase-daily.png)
+![鼠标靠近后展开专注面板](WindowIsle-r/docs/images/showcase-daily.png)
 
 ### 待办随手记，文件临时放
 
 把待办加到屏幕顶部，完成后勾选；需要提醒的事项可以单独设置日期和时间。置物架则用来临时收集文件，支持打开、定位原文件和拖出到其他应用。
 
-![从顶部展开待办清单](jilespace-daozai/docs/images/showcase-work.png)
+![从顶部展开待办清单](WindowIsle-r/docs/images/showcase-work.png)
 
 ### AI 额度，抬眼就能看见
 
@@ -71,14 +71,14 @@ Windows 桌面伙伴 · 音乐与歌词 · 邮件验证码 · 日程提醒 · AI
 
 ### 邮件和日程，放在同一条时间线上
 
-![日程提醒在屏幕顶部出现](jilespace-daozai/docs/images/showcase-calendar.png)
+![日程提醒在屏幕顶部出现](WindowIsle-r/docs/images/showcase-calendar.png)
 
 - 正式日历邀请自动进入日程；普通邮件正文出现日期不会自动创建日程。
 - 可忽略某条邮件日程，停止显示和提醒；邮件保留，可从详情恢复。
 - 滚轮只滚动下方列表；大卡片保持当前选择，点击其他日程才切换详情。
 - 同一场日程使用 UID 与开始时间去重，工作日历和邮件来源可以同时标识。
 
-以上为基于演示界面制作的 AI 产品展示图，展示收起、展开与提醒状态，界面细节以实际版本为准。[查看原始界面截图](jilespace-daozai/docs/images)。
+以上为基于演示界面制作的 AI 产品展示图，展示收起、展开与提醒状态，界面细节以实际版本为准。[查看原始界面截图](WindowIsle-r/docs/images)。
 
 ## 安装与更新
 
@@ -88,7 +88,7 @@ Windows 桌面伙伴 · 音乐与歌词 · 邮件验证码 · 日程提醒 · AI
 
 需要免安装使用时，下载 `WindowIsle-v0.6.49-windows-x64.zip` 并完整解压，运行其中的 `windowisle.exe`。程序仍默认使用当前用户的应用数据目录。
 
-当前版本不提供在线更新。有新版本时重新运行安装器覆盖安装即可，原设置和记录会保留。卸载可通过 Windows「已安装的应用」完成；卸载同样保留用户数据。详细操作见 [使用指南](jilespace-daozai/docs/USAGE.md)。
+当前版本不提供在线更新。有新版本时重新运行安装器覆盖安装即可，原设置和记录会保留。卸载可通过 Windows「已安装的应用」完成；卸载同样保留用户数据。详细操作见 [使用指南](WindowIsle-r/docs/USAGE.md)。
 
 **从「岛仔」升级：** 窗屿由「岛仔」改名而来，首次启动时会自动接管岛仔的数据：
 
@@ -122,14 +122,14 @@ QQ 收信、邮件日程和飞书个人日历已进行真实账号测试；钉�
 - 开启对应功能后会访问服务商接口和歌词服务，不等于完全离线软件。
 - Agent 任务只读 DeepSeek Harness 的本地缓存文件，不修改 DSH。
 
-完整说明见 [隐私与安全](jilespace-daozai/docs/PRIVACY.md)。
+完整说明见 [隐私与安全](WindowIsle-r/docs/PRIVACY.md)。
 
 ## 从源码构建
 
 需要 Rust stable、MSVC C++ 构建工具和 Windows SDK。开发时建议使用较新的 stable Rust。
 
 ```powershell
-cd jilespace-daozai
+cd WindowIsle-r
 rustup default stable-x86_64-pc-windows-msvc
 cargo build --locked --release --bin windowisle
 .\target\release\windowisle.exe
@@ -144,14 +144,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\package.ps1
 
 测试按单线程运行，以隔离使用进程环境变量的数据目录测试。低内存设备可设置 `$env:CARGO_BUILD_JOBS = "1"`。打包需要 NSIS 3，可通过 `-NsisCompiler` 指定 `makensis.exe`。发布脚本会检查程序版本和运行库依赖，生成单文件 EXE 安装器、精简免安装 ZIP 和 SHA-256 校验文件。
 
-项目结构、界面预览与贡献方式见 [开发指南](jilespace-daozai/CONTRIBUTING.md)。
+项目结构、界面预览与贡献方式见 [开发指南](WindowIsle-r/CONTRIBUTING.md)。
 
 ## 仓库结构
 
 ```
 Dynamic_Island/
 ├── README.md               ← 本文件
-├── jilespace-daozai/       ← 窗屿主程序（Rust + egui）
+├── WindowIsle-r/       ← 窗屿主程序（Rust + egui）
 │   ├── src/                ← 源码
 │   ├── assets/             ← 图标与素材
 │   ├── installer/          ← NSIS 安装器脚本
@@ -164,8 +164,8 @@ Dynamic_Island/
 
 ## 开源与致谢
 
-窗屿基于开源项目 [岛仔 Daozai](https://github.com/jilespace/jilespace-daozai)（MIT，© 2026 小唐的Token and Daozai contributors）修改而来，原作者的版权声明保留在 [jilespace-daozai/LICENSE](jilespace-daozai/LICENSE) 中。
+窗屿基于开源项目 [岛仔 Daozai](https://github.com/jilespace/WindowIsle-r)（MIT，© 2026 小唐的Token and Daozai contributors）修改而来，原作者的版权声明保留在 [WindowIsle-r/LICENSE](WindowIsle-r/LICENSE) 中。
 
-窗屿代码采用 [MIT License](jilespace-daozai/LICENSE)。Rust 依赖、vendored 代码、第三方图标及品牌标识沿用各自的许可或权利声明；MIT 不授予这些服务的商标使用权，也不代表官方合作或认证。详见 [第三方声明](jilespace-daozai/THIRD_PARTY_NOTICES.txt) 和 [依赖说明](jilespace-daozai/docs/DEPENDENCIES.md)。
+窗屿代码采用 [MIT License](WindowIsle-r/LICENSE)。Rust 依赖、vendored 代码、第三方图标及品牌标识沿用各自的许可或权利声明；MIT 不授予这些服务的商标使用权，也不代表官方合作或认证。详见 [第三方声明](WindowIsle-r/THIRD_PARTY_NOTICES.txt) 和 [依赖说明](WindowIsle-r/docs/DEPENDENCIES.md)。
 
 感谢 egui／eframe、Rust 社区，以及提供参考与素材的开源项目。

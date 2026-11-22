@@ -477,34 +477,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
-name = "windowisle"
-version = "0.6.49"
-dependencies = [
- "base64 0.22.1",
- "chrono",
- "chrono-tz",
- "eframe",
- "egui_extras",
- "flate2",
- "image",
- "imap",
- "keyring",
- "mailparse",
- "memmap2",
- "native-tls",
- "raw-window-handle",
- "regex",
- "ring",
- "rrule",
- "serde",
- "serde_json",
- "ureq",
- "url",
- "win-mem-cleaner",
- "windows",
-]
-
-[[package]]
 name = "data-encoding"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3536,6 +3508,34 @@ name = "winapi-x86_64-pc-windows-gnu"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
+
+[[package]]
+name = "windowisle"
+version = "0.6.49"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "chrono-tz",
+ "eframe",
+ "egui_extras",
+ "flate2",
+ "image",
+ "imap",
+ "keyring",
+ "mailparse",
+ "memmap2",
+ "native-tls",
+ "raw-window-handle",
+ "regex",
+ "ring",
+ "rrule",
+ "serde",
+ "serde_json",
+ "ureq",
+ "url",
+ "win-mem-cleaner",
+ "windows",
+]
 
 [[package]]
 name = "windows"
