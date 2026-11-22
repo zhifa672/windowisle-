@@ -1,0 +1,51 @@
+{
+  "version": 7,
+  "record": {
+    "identity": {
+      "formatVersion": 4,
+      "createdAt": 1793714565749,
+      "cwd": "D:\\Project\\example",
+      "isSeeded": false,
+      "inheritedEventCount": 0
+    },
+    "rows": {
+      "title": { "ver": 1, "seq": 673, "val": "窗屿计时优化" },
+      "todos": {
+        "ver": 2,
+        "seq": 673,
+        "val": [
+          { "content": "调研插件数据来源", "status": "completed" },
+          { "content": "核对窗屿布局", "status": "completed" },
+          { "content": "核对窗屿布局", "status": "completed" },
+          { "content": "设计交互布局", "status": "in_progress" },
+          { "content": "实现数据层", "status": "pending" }
+        ]
+      },
+      "tokenUsage": {
+        "ver": 2, "seq": 673,
+        "val": {
+          "totals": {
+            "uncachedInputTokens": 137346,
+            "outputTokens": 128056,
+            "cacheReadTokens": 28088320,
+            "cacheWriteTokens": 0
+          }
+        }
+      },
+      "sessionStats": {
+        "ver": 1, "seq": 673,
+        "val": {
+          "turns": 6, "steps": 185, "llmMs": 783364, "toolMs": 549785,
+          "ttftMs": 203160, "ttftSteps": 185, "decodeMs": 580204, "decodeTokens": 128056
+        }
+      },
+      "modelSelection": {
+        "ver": 1, "seq": 673,
+        "val": {
+          "lastUsed": { "provider": "deepseek-official", "model": "deepseek-flash", "reasoningEffort": "max" },
+          "pending": null
+        }
+      }
+    }
+  }
+}

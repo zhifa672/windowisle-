@@ -1,0 +1,3156 @@
+//! 灵动岛主体：状态、悬停形变、切页、顶栏与公共层。与平台无关——
+//! Windows 外壳（`main.rs`）和无窗口录制器（`windowisle-record`）共用同一份代码。
+//!
+//! 时间一律来自 `Env::t`（秒），不直接读系统时钟，所以录屏可逐帧复现。
+
+use crate::extras::{Alert, PetState};
+use crate::anim::{self, lerp, smoothstep, Spring};
+use crate::bar_layout::{self as bar, Layout};
+use crate::calendar;
+use crate::glass;
+use crate::lyrics;
+use crate::mail;
+use crate::model;
+use crate::paint::{self, Card, H};
+use crate::shape;
+use crate::smtc::{NowPlaying, Transport};
+use crate::theme::{self, size, W};
+use eframe::egui::{self, Color32, Pos2, Rect, Vec2};
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+// ---------- 几何（逻辑点；原版 125% 截图 ÷ 1.25） ----------
+pub const PW: f32 = 419.0; // 展开面板宽
+pub const PH: f32 = 140.0; // 展开面板高
+pub(crate) const CALENDAR_PAGE: usize = 7;
+/// Agent 任务（DeepSeek Harness）页。
+pub(crate) const DSH_PAGE: usize = 12;
+pub(crate) const CALENDAR_H: f32 = 216.0;
+pub const BAR_W: f32 = 163.0; // 收起药丸宽
+pub const BAR_H: f32 = 30.0; // 收起药丸高
+pub(crate) const HUD_W: f32 = 260.0;
+pub(crate) const LYRIC_BAR_W: f32 = 300.0;
+pub(crate) const HUD_TRACK_X: f32 = 48.0;
+pub(crate) const HUD_TRACK_W: f32 = 150.0;
+pub const BAR_W_MIN: f32 = 44.0; // 极简小条
+pub const BAR_H_MIN: f32 = 4.5;
+pub const FLARE: f32 = 17.6; // 顶部外翻肩宽
+pub const FLARE_H: f32 = 16.0; // 外翻收敛高度
+pub const RAD: f32 = 33.0; // 底部圆角
+pub const WIN_W: f32 = 640.0; // 窗口（透明画布）
+pub const CANVAS_W: f32 = WIN_W + 640.0; // 为右侧通知预留透明画布，原岛仍按 WIN_W 定位。
+pub const WIN_H: f32 = 270.0;
+pub(crate) const PAGE_NAMES: [&str; 13] = ["音乐", "专注", "饮水", "置物架", "待办", "邮箱", "AI 额度", "日程", "系统", "计时", "天气", "进程", "Agent 任务"];
+/// 每个页面对应的设置标签页（页面齿轮按钮、隐藏页面的跳转共用）。长度跟着 PAGE_NAMES 走：
+/// 新增页面时漏改会直接编译不过，而不是运行时数组越界崩溃。
+pub(crate) const PAGE_SETTINGS_TABS: [usize; PAGE_NAMES.len()] = [1, 2, 3, 5, 4, 7, 11, 8, 10, 10, 14, 10, 11];
+pub(crate) const PAGE_DESCRIPTIONS: [&str; 13] = [
+    "播放控制与同步歌词",
+    "番茄钟与休息计时",
+    "饮水记录与提醒",
+    "临时收纳文件位置",
+    "任务清单与到期提醒",
+    "邮件摘要与验证码",
+    "Agent 剩余额度和账号切换",
+    "月历、邮件邀请与工作日程",
+    "CPU、内存、网络与磁盘实时状态",
+    "倒计时与秒表",
+    "当前天气与逐小时预报",
+    "按 CPU 与内存排列的进程",
+    "DeepSeek Harness 会话的任务进度",
+];
+
+// ---------- 动效参数 ----------
+/// 悬停意图缓冲：光标停留这么久才真正展开（期间药丸轻微胀大作为反馈），防误触。
+const HOVER_INTENT: f64 = 0.20;
+const MINIMAL_HOVER_INTENT: f64 = 0.40;
+/// 移开后等待多久开始收起；这段时间内回来不会收。
+const LEAVE_DELAY: f64 = 0.12;
+const SWELL: (f32, f32) = (1.075, 1.13);
+// 展开：欠阻尼，末段约 5% 过冲后回落；高度略软于宽度，像「垂落」下来。
+const OPEN_W: (f32, f32) = (330.0, 0.70);
+const OPEN_H: (f32, f32) = (290.0, 0.74);
+// 收起：临界阻尼，约 0.18 s 干净收回，无回弹。
+const CLOSE: (f32, f32) = (620.0, 1.0);
+const SWELL_K: (f32, f32) = (420.0, 0.8);
+const PAGE_SLIDE: f32 = 46.0;
+
+pub struct Options {
+    /// 是否联网查歌词（录制/测试时关掉）。
+    pub fetch_lyrics: bool,
+    /// 吉祥物在多久无操作后出现（秒）。
+    pub pet_idle: f64,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self { fetch_lyrics: true, pet_idle: 45.0 }
+    }
+}
+
+/// 每帧由外壳提供的外部世界。
+#[derive(Clone, Default)]
+pub struct Env {
+    pub t: f64,
+    /// `HH:MM:SS`
+    pub clock: String,
+    /// `YYYY-MM-DD`
+    pub today: String,
+    /// 顶栏日期，例如 `10月28日 周三`
+    pub date: String,
+    pub battery: Option<u8>,
+    pub charging: bool,
+    /// 互联网连接状态；未知时不触发表情提醒。
+    pub network: Option<bool>,
+    /// 光标位置（与 `frame` 传入的 `win` 同一坐标系）；不在窗口附近时为 None。
+    pub cursor: Option<Pos2>,
+    pub idle_seconds: Option<f64>,
+    /// 前台浏览器的顶部是否与岛重叠；窗屿自身窗口或暂不可读时为 None。
+    pub browser_at_top: Option<bool>,
+    pub media: NowPlaying,
+    /// 系统主音量（0..100, 是否静音）；v0.5.4 音量条与系统双向同步。
+    pub volume: Option<(u32, bool)>,
+    /// 已连接的蓝牙音频设备（名称 + 可选电量）。
+    pub bt: Vec<crate::bt::Device>,
+    /// 蓝牙服务是否已经完成首次扫描。
+    pub bt_ready: bool,
+    /// CPU 使用率 0..100；外壳按秒采样。
+    pub cpu: Option<f32>,
+    /// 已用内存 / 总内存（字节）。
+    pub memory: Option<(u64, u64)>,
+    /// 下行 / 上行速率（字节每秒）。
+    pub network_rates: Option<(f64, f64)>,
+    /// 磁盘可用 / 总容量（字节）。
+    pub disk: Option<(u64, u64)>,
+}
+
+impl Env {
+    pub fn hour(&self) -> usize {
+        self.clock.get(0..2).and_then(|s| s.parse().ok()).unwrap_or(12)
+    }
+    pub fn minute(&self) -> u32 {
+        self.clock.get(3..5).and_then(|s| s.parse().ok()).unwrap_or(0)
+    }
+}
+
+/// 交给外壳执行的副作用。
+#[derive(Clone, Debug, PartialEq)]
+pub enum Cmd {
+    Media(Transport),
+    Open(PathBuf),
+    OpenUrl(String),
+    /// 把 DeepSeek Harness 桌面版切到前台（官方注册的 `dsh://open`，只显示窗口、不能指定会话）。
+    /// 单独一个命令而不是走 OpenUrl：OpenUrl 只放行 http/https，这里只打开这一个固定地址。
+    OpenDsh,
+    /// 需要键盘输入：外壳应让窗口可激活并取得焦点。
+    Focus,
+    Reveal(PathBuf),
+    Copy(String),
+    Notify(String, String),
+    RequestNotifications,
+    DisconnectNotifications,
+    ToggleAutostart,
+    AddFiles,
+    DragFile(PathBuf),
+    QuotaRefresh,
+    QuotaConnected,
+    QuotaChooseFile,
+    /// 把系统主音量设为 0..100（v0.5.4 音量条）。
+    SetVolume(u32),
+    /// 切换系统静音。
+    ToggleMute,
+    /// v0.5.5：账号清单变了，让外壳重新同步收信线程。
+    MailSync,
+    /// 测试某个邮箱的连接（授权码只在内存里传给工作线程）。
+    MailTest(mail::Account, String),
+    /// v0.5.6：用临时密码试连日历，成功后才允许落盘。
+    CalendarTest(calendar::Config, String),
+    /// 让外壳立即同步一次日历。
+    CalendarSync,
+    CalendarMonth(chrono::NaiveDate),
+    /// 断开并删除日历配置（凭据由界面删除）。
+    CalendarForget,
+    /// 清空剪贴板历史。
+    ClipboardClear,
+    WeatherRefresh,
+    OpenNotifications,
+    /// 立即清理一次系统内存（后台线程执行，结果以 toast 提示）。
+    CleanMemory,
+    /// 安装 / 修复 / 更新清理服务（一次 UAC）。
+    InstallCleanService,
+}
+
+pub struct FrameOut {
+    /// 原生窗口应保留的可见区域（相对 `win` 左上角）。
+    pub region: Rect,
+    /// 鼠标命中区（相对 `win` 左上角），区域外点击穿透到下层窗口。
+    pub hit: Rect,
+    pub notice_hit: Option<Rect>,
+    /// 文件拖入感应区；独立于普通鼠标命中区。
+    pub file_drop_zone: Option<Rect>,
+    /// 展开状态立即生效，不等待展开动画结束。
+    pub expanded: bool,
+    pub editing: bool,
+    pub animating: bool,
+    pub repaint_after: std::time::Duration,
+    pub cmds: Vec<Cmd>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Phase {
+    Focus,
+    Rest,
+}
+
+impl Phase {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Phase::Focus => "专注时间",
+            Phase::Rest => "休息",
+        }
+    }
+}
+
+pub(crate) struct Pomo {
+    pub phase: Phase,
+    pub remaining: f32,
+    pub running: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct LyricsState {
+    pub key: String,
+    pub loading: bool,
+    pub error: Option<lyrics::FetchError>,
+    pub retry_at: Option<f64>,
+    pub lyrics: Option<lyrics::Lyrics>,
+    pub rx: Option<std::sync::mpsc::Receiver<Result<(lyrics::Lyrics,bool), lyrics::FetchError>>>,
+    pub native_rx: Option<std::sync::mpsc::Receiver<Option<lyrics::Lyrics>>>,
+}
+
+/// v0.5.5：邮件面板与设置表单的界面状态。正文只在内存里过一次，不落盘。
+#[derive(Default)]
+pub(crate) struct MailState {
+    pub accounts: Vec<mail::Account>,
+    /// 每个账号的连接状态，键是邮箱小写。
+    pub status: HashMap<String, mail::Status>,
+    /// 最近邮件，新的在前，最多 60 封。
+    pub recent: Vec<mail::Item>,
+    /// 设置页里「测试连接」的结果。
+    pub note: String,
+    /// 添加邮箱表单的校验错误（比如没填邮箱），紧贴按钮下方用警示色显示；
+    /// 校验通过或换了邮箱类型时清掉。
+    pub form_error: Option<&'static str>,
+    pub testing: Option<String>,
+    pub form: MailForm,
+    /// 面板里点开的邮件（账号 + uid，避免两个账号 uid 撞车）。
+    pub open_uid: Option<(String, u32)>,
+    pub reading: Option<mail::Item>,
+    pub reader_focus: bool,
+    /// 已经提醒过的会议，键是 `UID + DTSTART`（邮件和日历两条来源共用）。
+    pub fired: std::collections::HashSet<String>,
+}
+
+/// Agent 任务页的界面状态（见 docs 设计文档第 5 节）。
+#[derive(Default)]
+pub(crate) struct DshState {
+    /// 有任务、24h 内活跃的会话（更新时间从新到旧）。
+    pub sessions: Vec<crate::dsh_tasks::Session>,
+    pub status: Option<crate::dsh_tasks::Status>,
+    /// 展开页当前选中的会话 id；None = 最近更新的那个。
+    pub selected: Option<String>,
+    /// 清单第一行显示第几条任务（滚轮滚动）。
+    pub first: usize,
+    /// 上次自动滚动对准的 (会话 id, 任务下标)，避免每次刷新拉回用户滚动。
+    pub followed: Option<(String, usize)>,
+    /// 会话标签行的翻页基址（每组 3 个）。
+    pub sessions_tab_base: usize,
+    /// 每个会话「全部完成」的时刻（App::t），收起态显示对勾 60 秒用。
+    pub done_at: std::collections::HashMap<String, f64>,
+    pub watch: crate::dsh_tasks::Watch,
+}
+
+#[derive(Default)]
+pub(crate) struct MailForm {
+    pub provider: mail::Provider,
+    pub email: String,
+    pub password: String,
+    pub show: bool,
+    /// 自定义邮箱（Custom）：服务器 / 端口 / 用户名 / 证书与加密方式。
+    pub imap_host: String,
+    pub imap_port: String,
+    pub imap_user: String,
+    pub imap_insecure: bool,
+    /// 自定义邮箱：STARTTLS（143 明文连接后升级）。
+    pub imap_starttls: bool,
+}
+
+impl MailState {
+    /// 最近一封带验证码的邮件。
+    pub fn code_item(&self) -> Option<&mail::Item> {self.recent.iter().find(|m|m.code.is_some())}
+    pub fn status_of(&self, email: &str) -> mail::Status {
+        self.status
+            .get(&email.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or(mail::Status::Idle)
+    }
+}
+
+/// v0.5.6：日程（CalDAV）的界面状态。密码只在表单里暂存，保存后立刻清掉。
+#[derive(Default)]
+pub(crate) struct CalendarState {
+    pub local: Vec<crate::local_calendar::Entry>,
+    pub local_error: String,
+    pub draft: Option<crate::local_calendar::Draft>,
+    pub feeds: Vec<CalendarFeed>,
+    pub config: Option<calendar::Config>,
+    /// 未来 24 小时的日程（提醒也读这里）。
+    pub events: Vec<mail::Meeting>,
+    pub view: crate::calendar_ui::State,
+    pub connected: bool,
+    pub last_sync: String,
+    /// 连续失败次数；>= 2 才在设置页显示红字。
+    pub failures: u32,
+    pub error: String,
+    pub testing: bool,
+    /// 设置表单里的提示（成功/失败/粘贴拆分的说明）。
+    pub note: String,
+    /// `note` 是不是错误提示（界面显示成红字）。
+    pub note_error: bool,
+    pub form: CalendarForm,
+    /// 「测试并保存」用的临时密码，测试成功才落盘。
+    pub test_password: String,
+}
+
+pub(crate) struct CalendarFeed {
+    pub config: calendar::Config,
+    pub events: Vec<mail::Meeting>,
+    pub month: crate::calendar_ui::State,
+    pub connected: bool,
+    pub last_sync: String,
+    pub failures: u32,
+    pub error: String,
+}
+
+impl CalendarFeed {
+    fn new(config: calendar::Config) -> Self {
+        Self { config, events: vec![], month: Default::default(), connected: false,
+            last_sync: String::new(), failures: 0, error: String::new() }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct CalendarForm {
+    pub provider: calendar::Provider,
+    pub username: String,
+    pub password: String,
+    pub show: bool,
+    pub guide_open: bool,
+}
+
+impl CalendarState {
+    pub fn load() -> Self {
+        let config = calendar::load_config();
+        let form = CalendarForm { provider: calendar::selected_provider(),
+            username: config.as_ref().map(|cfg| cfg.username.clone()).unwrap_or_default(), ..Default::default() };
+        let feeds = calendar::load_configs().into_iter().map(CalendarFeed::new).collect();
+        let (local,local_error)=match crate::local_calendar::load(){Ok(events)=>(events,String::new()),Err(error)=>(vec![],error)};
+        Self { config, form, feeds, local, local_error, ..Default::default() }
+    }
+
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WeatherState {
+    pub current: Option<crate::weather::Weather>,
+    pub error: Option<String>,
+    pub loading: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TimerMode {
+    Countdown,
+    Stopwatch,
+}
+
+/// 倒计时可设定的最长时长：23:59:59。
+pub(crate) const TIMER_MAX_SECONDS: u32 = 24 * 3600 - 1;
+
+/// 设定倒计时时长时可单独调整的一段。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TimerField {
+    Hours,
+    Minutes,
+    Seconds,
+}
+
+/// 键入的数字（从右往左填，最多 6 位）→ 秒数：「730」是 07:30，「90」是 90 秒。
+/// 分、秒两段允许填到 99，按实际秒数折算，超过上限取 23:59:59。
+pub(crate) fn timer_entry_seconds(digits: &str) -> u32 {
+    let padded = format!("{digits:0>6}");
+    let part = |range: std::ops::Range<usize>| padded.get(range).and_then(|p| p.parse::<u32>().ok()).unwrap_or(0);
+    (part(0..2) * 3600 + part(2..4) * 60 + part(4..6)).min(TIMER_MAX_SECONDS)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TimerState {
+    pub mode: TimerMode,
+    /// 倒计时设定时长（秒）。
+    pub total: f64,
+    /// 倒计时剩余（秒）。
+    pub remaining: f64,
+    /// 秒表已用（秒）。
+    pub elapsed: f64,
+    pub running: bool,
+    pub laps: Vec<f64>,
+    lap_start: f64,
+    /// 正在用键盘输入的时长数字；`None` 表示没在输入。
+    pub entry: Option<String>,
+    /// 触控板滚动的累积量，攒够一步才调整一次。
+    pub wheel: f32,
+}
+
+impl Default for TimerState {
+    fn default() -> Self {
+        Self {
+            mode: TimerMode::Countdown,
+            total: 25.0 * 60.0,
+            remaining: 25.0 * 60.0,
+            elapsed: 0.0,
+            running: false,
+            laps: Vec::new(),
+            lap_start: 0.0,
+            entry: None,
+            wheel: 0.0,
+        }
+    }
+}
+
+impl TimerState {
+    /// 返回 `true` 表示倒计时刚刚结束。
+    pub(crate) fn tick(&mut self, seconds: f64) -> bool {
+        if !self.running || seconds <= 0.0 {
+            return false;
+        }
+        match self.mode {
+            TimerMode::Countdown => {
+                self.remaining = (self.remaining - seconds).max(0.0);
+                if self.remaining <= 0.0 {
+                    // 结束后回到设定状态，可以直接再开始或改时长。
+                    self.running = false;
+                    self.remaining = self.total;
+                    self.laps.clear();
+                    return true;
+                }
+            }
+            TimerMode::Stopwatch => self.elapsed += seconds,
+        }
+        false
+    }
+
+    pub(crate) fn toggle(&mut self) {
+        match self.mode {
+            TimerMode::Countdown => {
+                if self.total <= 0.0 {
+                    return;
+                }
+                if self.remaining <= 0.0 {
+                    self.remaining = self.total;
+                }
+                self.entry = None;
+                self.running = !self.running;
+            }
+            TimerMode::Stopwatch => self.running = !self.running,
+        }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.running = false;
+        self.entry = None;
+        match self.mode {
+            TimerMode::Countdown => self.remaining = self.total,
+            TimerMode::Stopwatch => {
+                self.elapsed = 0.0;
+                self.laps.clear();
+                self.lap_start = 0.0;
+            }
+        }
+    }
+
+    pub(crate) fn set_mode(&mut self, mode: TimerMode) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        self.running = false;
+        self.entry = None;
+        self.laps.clear();
+        self.lap_start = 0.0;
+        self.elapsed = 0.0;
+        self.remaining = self.total;
+    }
+
+    pub(crate) fn set_preset(&mut self, minutes: u32) {
+        self.set_total(minutes.clamp(1, 180) * 60);
+    }
+
+    /// 设定倒计时时长并回到设定状态（允许 0，0 时不能开始）。
+    pub(crate) fn set_total(&mut self, seconds: u32) {
+        self.mode = TimerMode::Countdown;
+        self.total = seconds.min(TIMER_MAX_SECONDS) as f64;
+        self.remaining = self.total;
+        self.running = false;
+        self.entry = None;
+    }
+
+    /// 倒计时处于设定状态（未开始、已重置或刚结束）：大号时间可以直接编辑。
+    /// 暂停在中途时不算，要先重置。
+    pub(crate) fn editable(&self) -> bool {
+        self.mode == TimerMode::Countdown && !self.running && self.remaining >= self.total
+    }
+
+    /// 时、分、秒各自循环加减，不向上一段进位（59 秒再加一回到 00）。
+    pub(crate) fn adjust(&mut self, field: TimerField, delta: i32) {
+        let total = self.total.max(0.0).round() as i64;
+        let (mut hours, mut minutes, mut seconds) = (total / 3600, total / 60 % 60, total % 60);
+        let delta = delta as i64;
+        match field {
+            TimerField::Hours => hours = (hours + delta).rem_euclid(24),
+            TimerField::Minutes => minutes = (minutes + delta).rem_euclid(60),
+            TimerField::Seconds => seconds = (seconds + delta).rem_euclid(60),
+        }
+        self.set_total((hours * 3600 + minutes * 60 + seconds) as u32);
+    }
+
+    /// 开始键盘输入（只在设定状态下有效）。
+    pub(crate) fn begin_entry(&mut self) {
+        if self.editable() && self.entry.is_none() {
+            self.entry = Some(String::new());
+        }
+    }
+
+    pub(crate) fn type_digit(&mut self, digit: u8) {
+        if let Some(entry) = &mut self.entry {
+            // 开头的 0 不占位，和微波炉、手机计时器的输入习惯一致。
+            if digit <= 9 && entry.len() < 6 && !(entry.is_empty() && digit == 0) {
+                entry.push(char::from(b'0' + digit));
+            }
+        }
+    }
+
+    pub(crate) fn erase_digit(&mut self) {
+        if let Some(entry) = &mut self.entry {
+            entry.pop();
+        }
+    }
+
+    /// 结束键盘输入：输入有效就采用新时长；没输入或折算为 0 时保留原时长。
+    /// 返回是否采用了新时长。
+    pub(crate) fn commit_entry(&mut self) -> bool {
+        let Some(entry) = self.entry.take() else { return false };
+        let seconds = timer_entry_seconds(&entry);
+        if seconds == 0 {
+            return false;
+        }
+        self.set_total(seconds);
+        true
+    }
+
+    pub(crate) fn lap(&mut self) {
+        if self.mode != TimerMode::Stopwatch {
+            return;
+        }
+        self.laps.push(self.elapsed - self.lap_start);
+        self.lap_start = self.elapsed;
+        if self.laps.len() > 3 {
+            self.laps.remove(0);
+        }
+    }
+
+    pub(crate) fn display(&self) -> String {
+        let seconds = match self.mode {
+            TimerMode::Countdown => self.remaining,
+            TimerMode::Stopwatch => self.elapsed,
+        }
+        .max(0.0)
+        .ceil() as u64;
+        if seconds >= 3600 {
+            format!("{:02}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60)
+        } else {
+            format!("{:02}:{:02}", seconds / 60, seconds % 60)
+        }
+    }
+
+    pub(crate) fn progress(&self) -> f32 {
+        if self.total <= 0.0 {
+            0.0
+        } else {
+            (self.remaining / self.total).clamp(0.0, 1.0) as f32
+        }
+    }
+}
+
+pub(crate) struct SystemPageState {
+    pub perf: crate::perf::Performance,
+    pub history: crate::perf::History,
+    /// 展示用缓动量，避免每秒采样时数字与曲线跳动。
+    pub cpu: Spring,
+    pub memory: Spring,
+    pub disk: Spring,
+    pub down: Spring,
+    pub up: Spring,
+    pub sample_at: f64,
+}
+
+impl Default for SystemPageState {
+    fn default() -> Self {
+        Self {
+            perf: Default::default(),
+            history: Default::default(),
+            cpu: Spring::new(0.0, 110.0, 0.9),
+            memory: Spring::new(0.0, 110.0, 0.9),
+            disk: Spring::new(0.0, 110.0, 0.9),
+            down: Spring::new(0.0, 120.0, 0.88),
+            up: Spring::new(0.0, 120.0, 0.88),
+            sample_at: -10.0,
+        }
+    }
+}
+
+impl SystemPageState {
+    pub(crate) fn has_data(&self) -> bool {
+        self.perf.cpu.is_some()
+            || self.perf.memory.is_some()
+            || self.perf.network.is_some()
+            || self.perf.disk.is_some()
+    }
+
+    /// 每秒落一个历史点，并把展示值平滑地追向最新采样。
+    pub(crate) fn update(&mut self, env: &Env, dt: f32) {
+        let next = crate::perf::Performance {
+            cpu: env.cpu,
+            memory: env.memory,
+            network: env.network_rates,
+            disk: env.disk,
+        };
+        if next != self.perf {
+            self.perf = next;
+        }
+        if self.has_data() && env.t - self.sample_at >= 0.9 {
+            self.sample_at = env.t;
+            self.history.push(
+                self.perf.cpu,
+                self.perf.network.map(|(down, _)| down),
+                self.perf.network.map(|(_, up)| up),
+            );
+        }
+        let cpu = self.perf.cpu.unwrap_or(self.cpu.target);
+        let memory = self
+            .perf
+            .memory
+            .map(|(used, total)| if total == 0 { 0.0 } else { used as f32 / total as f32 * 100.0 })
+            .unwrap_or(self.memory.target);
+        let disk = self
+            .perf
+            .disk
+            .map(|(free, total)| if total == 0 { 0.0 } else { (total - free) as f32 / total as f32 * 100.0 })
+            .unwrap_or(self.disk.target);
+        let (down, up) = self
+            .perf
+            .network
+            .map(|(down, up)| (down as f32, up as f32))
+            .unwrap_or((self.down.target, self.up.target));
+        self.cpu.target = cpu.clamp(0.0, 100.0);
+        self.memory.target = memory.clamp(0.0, 100.0);
+        self.disk.target = disk.clamp(0.0, 100.0);
+        self.down.target = down.max(0.0);
+        self.up.target = up.max(0.0);
+        for spring in [&mut self.cpu, &mut self.memory, &mut self.disk, &mut self.down, &mut self.up] {
+            spring.step(dt);
+        }
+    }
+
+    #[cfg(feature = "record")]
+    pub(crate) fn demo(&mut self) {
+        use std::f32::consts::TAU;
+        // 伪随机噪声让演示曲线像真实采样，而不是规则正弦波。
+        let noise = |index: usize, salt: u64| {
+            let mut value = (index as u64).wrapping_mul(6364136223846793005).wrapping_add(salt);
+            value ^= value >> 33;
+            value = value.wrapping_mul(0xff51afd7ed558ccd);
+            value ^= value >> 33;
+            (value % 1000) as f32 / 1000.0
+        };
+        let samples = (0..crate::perf::History::LEN).map(|index| {
+            let phase = index as f32 / crate::perf::History::LEN as f32 * TAU * 2.0;
+            let cpu = (14.0 + phase.sin().abs() * 26.0 + noise(index, 11) * 34.0).clamp(2.0, 96.0);
+            let down = 60_000.0 + noise(index, 23) * 2_400_000.0 + phase.sin().abs() * 700_000.0;
+            let up = 18_000.0 + noise(index, 37) * 260_000.0;
+            (cpu, down, up)
+        });
+        self.history.seed(samples);
+        self.perf = crate::perf::Performance {
+            cpu: Some(31.0),
+            memory: Some((9_760_000_000, 16_000_000_000)),
+            network: Some((1_180_000.0, 86_000.0)),
+            disk: Some((312_000_000_000, 512_000_000_000)),
+        };
+        self.cpu.snap(31.0);
+        self.memory.snap(61.0);
+        self.disk.snap(39.0);
+        self.down.snap(1_180_000.0);
+        self.up.snap(86_000.0);
+        self.sample_at = 0.0;
+    }
+}
+
+/// 系统 HUD 透明度步进：关闭动画时直接落到目标值。
+pub(crate) fn hud_alpha_step(current: f32, target: f32, dt: f32, motion: bool, rising: bool) -> f32 {
+    if motion {
+        crate::anim::approach(current, target, if rising { 16.0 } else { 8.0 }, dt)
+    } else {
+        target
+    }
+}
+
+pub struct App {
+    pub opts: Options,
+    pub settings: model::Settings,
+    pub(crate) todos: model::TodoList,
+    pub(crate) water: model::Water,
+    pub(crate) shelf: model::Shelf,
+
+    // 形变
+    w: Spring,
+    h: Spring,
+    pub(crate) open: bool,
+    hover_since: Option<f64>,
+    leave_since: Option<f64>,
+    /// 前台切换导致的强制收起：光标离开前不再自动展开。
+    pub hover_lock: bool,
+    pub(crate) reveal: f32,
+
+    // 切页
+    pub(crate) page: usize,
+    page_from: usize,
+    page_dir: f32,
+    page_t0: f64,
+    slide: Spring,
+    dots: [Spring; 13],
+    wheel_delta: f32,
+    wheel_at: f64,
+    wheel_page_at: f64,
+
+    // 拖入
+    pub(crate) drag_hot: bool,
+    pub(crate) drag_a: f32,
+    drag_saved: Option<usize>,
+
+    // 置物架
+    pub(crate) shelf_scroll: Spring,
+    pub(crate) shelf_first: usize,
+    pub(crate) shelf_x: HashMap<PathBuf, Spring>,
+    pub(crate) shelf_born: HashMap<PathBuf, f64>,
+    pub(crate) icons: crate::icons::Cache,
+    pub(crate) confirm_clear: Option<f64>,
+
+    // 饮水
+    pub(crate) water_ring: Spring,
+    pub(crate) water_ml: f32,
+    pub(crate) water_view: usize,
+    pub(crate) water_view_t: Spring,
+    pub(crate) remind_t: Spring,
+    pub(crate) last_reminder: f64,
+
+    // 专注
+    pub(crate) pomo: Pomo,
+    pub(crate) ring_shown: Spring,
+    pub(crate) reset_spin: Spring,
+
+    // 待办
+    pub(crate) adding: bool,
+    pub(crate) editing: Option<usize>,
+    pub(crate) buf: String,
+    pub(crate) todo_input_focused: bool,
+    pub(crate) todo_pop: Spring,
+
+    // 音乐
+    pub(crate) ly: LyricsState,
+    pub(crate) show_lyrics: bool,
+    island_lyric_layout: Option<std::sync::Arc<egui::Galley>>,
+    media_anchor: (String, f64, f64, bool),
+    pub(crate) media: NowPlaying,
+    pub(crate) music_artwork: Option<(std::sync::Arc<egui::ColorImage>,egui::TextureHandle)>,
+
+    forced_open_until:f64,
+    pub settings_open:bool,
+    browser_at_top:bool,
+    browser_minimal_active:bool,
+    pub(crate) settings_focus_requested:bool,
+    pub(crate) settings_saved_at:Option<f64>,
+    pub(crate) settings_tab:usize,
+    /// 设置侧栏搜索关键字（打开设置时清空）。
+    pub(crate) settings_query:String,
+    pub(crate) settings_category:usize,
+    pub(crate) notification_apps:model::NotificationApps,
+    pub(crate) subpage:Option<usize>,
+    pub(crate) task_dialog:Option<crate::extras::TaskDraft>,
+    pub listener_status: String,
+    /// 剪贴板热键冲突或历史读写状态，设置页展示。
+    pub clipboard_status: String,
+    pub(crate) notification_bell_until: f64,
+    pub(crate) notification_bell_at: f64,
+    pub(crate) notice: Option<Alert>,
+    pub(crate) hud_notice: Option<Alert>,
+    hud_alpha: f32,
+    notice_width: Spring,
+    notice_details: bool,
+    pub(crate) alerts: std::collections::VecDeque<Alert>,
+    pub(crate) history: std::collections::VecDeque<Alert>,
+    pub(crate) pending: Vec<Cmd>,
+    pub(crate) todo_first: usize,
+    pub(crate) pet: crate::pet::Pet,
+    pub(crate) last_drink: Option<(u32, usize)>,
+    // 其它
+    toast: Option<(String, f64)>,
+    toast_below: bool,
+    last_input: f64,
+    system_idle: Option<f64>,
+    last_cursor: Option<Pos2>,
+    pet_a: f32,
+    last_t: Option<f64>,
+    pub(crate) t: f64,
+    pub(crate) dt: f32,
+    pub(crate) today: String,
+    pub(crate) current_hour: usize,
+    pub(crate) cursor_local: Option<Pos2>,
+    started: bool,
+    /// v0.5.4：音量条展示值（拖动时先用本地值，随后跟上系统回报）。
+    pub(crate) volume_ui: Option<(u32, bool)>,
+    /// 拖动/滚轮刚改过音量，这段时间内系统回声不再单独弹一条。
+    pub(crate) volume_quiet_until: f64,
+    /// 音量条填充的缓动量（0..1），让数值变化有「量感」。
+    pub(crate) volume_a: f32,
+    /// 上一次看到的蓝牙设备，用来只在连接/断开时提示一次。
+    pub(crate) bt_shown: Vec<crate::bt::Device>,
+    bt_initialized: bool,
+    /// v0.5.5：邮件账号、最近邮件与设置表单。
+    pub(crate) mail: MailState,
+    /// v0.5.6：日历（CalDAV）配置、未来 24 小时事件与设置表单。
+    pub(crate) calendar: CalendarState,
+    pub(crate) quota: crate::quota_ui::State,
+    pub(crate) updates: crate::updates::State,
+    pub(crate) resident: bar::Motion,
+    pub(crate) resident_power: (Option<u8>,bool),
+    /// 系统页：采样快照、历史曲线与展示缓动。
+    pub(crate) system: SystemPageState,
+    /// 计时页：倒计时与秒表。
+    pub(crate) timer: TimerState,
+    /// 内存清理：进行中标志、最近结果与提权情况。
+    pub(crate) mem: crate::mem_clean::State,
+    /// Agent 任务（DeepSeek Harness）：会话清单、选中、滚动与提醒状态。
+    pub(crate) dsh: DshState,
+    /// 天气页：最近一次成功数据、错误与加载状态。
+    pub(crate) weather: WeatherState,
+    /// 进程页：最近一次进程排行快照。
+    pub(crate) processes: crate::processes::Snapshot,
+    /// 进程页排序方式（CPU / 内存）。
+    pub(crate) process_sort: crate::processes::ProcessSort,
+    /// 天气多城市列表里当前选中的下标（会话内）。
+    pub(crate) weather_city_index: usize,
+    /// 天气页右侧卡片：`true` 显示多日预报，`false` 显示逐小时。
+    pub(crate) weather_days: bool,
+    /// 最近一帧系统音频频谱。
+    pub(crate) spectrum: crate::audio::Spectrum,
+    spectrum_at: f64,
+    /// 通知历史：Windows 通知镜像，持久化到本机。
+    pub(crate) notifications: crate::notifications::Store,
+    /// 通知历史版本号；外壳据此判断是否需要刷新面板。
+    pub(crate) notifications_revision: u64,
+}
+
+impl App {
+    pub fn new(ctx: &egui::Context, opts: Options) -> Self {
+        theme::load_fonts(ctx);
+        egui_extras::install_image_loaders(ctx);
+        ctx.set_theme(egui::ThemePreference::Dark);
+        ctx.set_visuals(egui::Visuals::dark());
+        ctx.style_mut(|s| {
+            s.interaction.selectable_labels = false;
+            s.visuals.text_cursor.stroke = egui::Stroke::new(1.5_f32, theme::BLUE);
+            s.visuals.selection.bg_fill = theme::alpha_blue(0.45);
+        });
+        let settings = model::Settings::load();
+        crate::bar_layout::set_motion_override(settings.motion.enabled());
+        let (bw, bh) = if settings.minimal { (BAR_W_MIN, BAR_H_MIN) } else { (BAR_W, BAR_H) };
+        let focus_seconds=settings.focus_minutes as f32*60.0;
+        let initial_lyrics=settings.lyrics_enabled;
+        let initial_page=settings.page_order.iter().copied().find(|page|settings.visible_pages[*page]).unwrap_or(0);
+        Self {
+            opts,
+            settings,
+            todos: model::TodoList::load(),
+            water: model::Water::default(),
+            shelf: model::Shelf::load(),
+            w: Spring::new(bw, CLOSE.0, CLOSE.1),
+            h: Spring::new(bh, CLOSE.0, CLOSE.1),
+            open: false,
+            hover_since: None,
+            leave_since: None,
+            hover_lock: false,
+            reveal: 0.0,
+            page: initial_page,
+            page_from: initial_page,
+            page_dir: 1.0,
+            page_t0: -10.0,
+            slide: Spring::new(0.0, 260.0, 0.92),
+            dots: std::array::from_fn(|i| Spring::new(if i == initial_page { 16.0 } else { 4.0 }, 380.0, 0.86)),
+            wheel_delta: 0.0,
+            wheel_at: -1.0,
+            wheel_page_at: -1.0,
+            drag_hot: false,
+            drag_a: 0.0,
+            drag_saved: None,
+            shelf_scroll: Spring::new(0.0, 300.0, 0.9),
+            shelf_first: 0,
+            shelf_x: HashMap::new(),
+            shelf_born: HashMap::new(),
+            icons: Default::default(),
+            confirm_clear: None,
+            water_ring: Spring::new(0.0, 120.0, 0.9),
+            water_ml: 0.0,
+            water_view: 0,
+            water_view_t: Spring::new(0.0, 200.0, 0.9),
+            remind_t: Spring::new(1.0, 400.0, 0.8),
+            last_reminder: 0.0,
+            pomo: Pomo { phase: Phase::Focus, remaining: focus_seconds, running: false },
+            ring_shown: Spring::new(1.0, 160.0, 0.95),
+            reset_spin: Spring::new(0.0, 160.0, 0.82),
+            adding: false,
+            todo_input_focused: false,
+            editing: None,
+            buf: String::new(),
+            todo_pop: Spring::new(0.0, 500.0, 0.45),
+            ly: LyricsState::default(),
+            show_lyrics: initial_lyrics,
+            island_lyric_layout: None,
+            media_anchor: (String::new(), 0.0, 0.0, false),
+            media: NowPlaying::default(),
+            music_artwork: None,
+            forced_open_until:0.0, settings_open:false, browser_at_top:false, browser_minimal_active:false, settings_focus_requested:false, settings_saved_at:None, settings_tab:0, settings_query:String::new(), settings_category:0, notification_apps:model::NotificationApps::load(), subpage:None, task_dialog:None,
+            listener_status: "尚未连接".into(),
+            clipboard_status: String::new(),
+            notification_bell_until: 0.0, notification_bell_at: -10.0, notice: None, hud_notice: None, hud_alpha: 0.0, notice_width:Spring::new(0.0,CLOSE.0,CLOSE.1), notice_details:false, alerts: Default::default(), history: Default::default(), pending: vec![],
+            todo_first: 0, pet: Default::default(), last_drink: None,
+            toast: None, toast_below: false,
+            last_input: 0.0, system_idle: None,
+            last_cursor: None,
+            pet_a: 0.0,
+            last_t: None,
+            t: 0.0,
+            dt: 0.0,
+            today: String::new(), current_hour: 0,
+            cursor_local: None,
+            started: false,
+            volume_ui: None,
+            volume_quiet_until: 0.0,
+            volume_a: 0.0,
+            bt_shown: Vec::new(),
+            bt_initialized: false,
+            mail: MailState { accounts: mail::load_accounts(), ..Default::default() },
+            calendar: CalendarState::load(),
+            quota: crate::quota_ui::State::load(),
+            updates: Default::default(),
+            resident: Default::default(), resident_power:(None,false),
+            system: SystemPageState::default(),
+            timer: TimerState::default(),
+            mem: crate::mem_clean::State::new(),
+            dsh: DshState::default(),
+            weather: WeatherState::default(),
+            processes: crate::processes::Snapshot::default(),
+            process_sort: crate::processes::ProcessSort::default(),
+            weather_city_index: 0,
+            spectrum: crate::audio::Spectrum::default(),
+            spectrum_at: -10.0,
+            weather_days: false,
+            notifications: crate::notifications::Store::load(),
+            notifications_revision: 0,
+        }
+    }
+
+    pub fn say(&mut self, msg: impl Into<String>) {
+        self.toast = Some((msg.into(), self.t));
+        self.toast_below = false;
+    }
+
+    pub(crate) fn code_copied(&mut self, code:&str) {
+        self.say(format!("验证码 {code} 已复制"));
+        self.toast_below = true;
+    }
+
+    /// 收信服务推来的事件；历史邮件静默，新邮件进入通知队列。
+    pub fn mail_event(&mut self, ev: mail::Event) {
+        let watching=|email:&str|self.settings.mail_enabled && self.mail.accounts.iter().any(|a|a.enabled && a.email.eq_ignore_ascii_case(email));
+        match ev {
+            mail::Event::Status { account, status } => {
+                if !watching(&account){return;}
+                self.mail.status.insert(account.to_ascii_lowercase(), status);
+            }
+            mail::Event::Mail { item, new } => {
+                if !watching(&item.account){return;}
+                self.mail
+                    .recent
+                    .retain(|m| !(m.account.eq_ignore_ascii_case(&item.account) && m.uid == item.uid));
+                self.mail.recent.insert(0, item);
+                self.mail.recent.truncate(60);
+                if new && self.settings.mail_enabled {
+                    let item=&self.mail.recent[0];
+                    self.alert("新邮件",format!("{} · {}",item.from,item.subject),5,false);
+                    self.notification_bell_at = self.t;
+                    self.notification_bell_until = self.t + 6.0;
+                }
+            }
+            mail::Event::Test { account, ok, note } => {
+                self.mail.testing = None;
+                let detail = if ok { "连接成功".to_string() } else { note };
+                let detail = if detail.chars().count() > 120 {
+                    format!("{}…", detail.chars().take(120).collect::<String>())
+                } else {
+                    detail
+                };
+                self.mail.note = format!("{account}：{detail}");
+                self.say(if ok {
+                    format!("{account} 连接成功")
+                } else {
+                    format!("{account} 连接失败")
+                });
+            }
+        }
+    }
+
+    /// 设置窗口第 8 个标签页：邮件。
+    pub fn open_mail_settings(&mut self) {
+        self.settings_tab = 7;
+        self.open_settings();
+    }
+
+    /// v0.5.6：日历服务推来的事件。失败不弹窗，只累计次数（连续两次才显示红字）。
+    pub fn calendar_event(&mut self, ev: calendar::Event) {
+        match ev {
+            calendar::Event::Test { ok, message, count, config } => {
+                self.calendar.testing = false;
+                if !ok {
+                    self.calendar.note = message;
+                    self.calendar.note_error = true;
+                    return;
+                }
+                let Some(cfg) = config else {
+                    self.calendar.note = "服务器没有返回日历地址".into();
+                    self.calendar.note_error = true;
+                    return;
+                };
+                if let Err(e) = calendar::save_connection(&cfg, &self.calendar.test_password, self.calendar.config.as_ref()) {
+                    self.calendar.note = e;
+                    self.calendar.note_error = true;
+                    return;
+                }
+                self.calendar.note = format!("已连接 · 未来 24 小时 {count} 个日程");
+                self.calendar.note_error = false;
+                if self.calendar.config.as_ref()!=Some(&cfg) {
+                    self.calendar.events.clear();
+                    self.calendar.view.events.clear();
+                    self.calendar.view.loaded=None;
+                    self.calendar.view.loading=false;
+                    self.calendar.view.error.clear();
+                }
+                if !self.calendar.feeds.iter().any(|feed| feed.config == cfg) {
+                    self.calendar.feeds.retain(|feed| feed.config.provider != cfg.provider);
+                    self.calendar.feeds.push(CalendarFeed::new(cfg.clone()));
+                }
+                self.calendar.config = Some(cfg);
+                self.calendar.connected = true;
+                self.calendar.failures = 0;
+                self.calendar.error.clear();
+                self.calendar.last_sync = calendar::now_label();
+                self.calendar.test_password.clear();
+                self.calendar.form.password.clear();
+                self.pending.push(Cmd::CalendarSync);
+                if self.page==CALENDAR_PAGE {self.select_calendar_day(self.calendar.view.day);}
+            }
+            calendar::Event::Synced { config, events, at } => {
+                if let Some(feed)=self.calendar.feeds.iter_mut().find(|feed|feed.config==config) {
+                    feed.events=events.clone();feed.connected=true;feed.failures=0;feed.error.clear();feed.last_sync=at.clone();
+                }
+                if self.calendar.config.as_ref()!=Some(&config){return;}
+                self.calendar.events = events;
+                self.calendar.connected = true;
+                self.calendar.failures = 0;
+                self.calendar.error.clear();
+                self.calendar.last_sync = at;
+            }
+            calendar::Event::MonthLoaded { config, month, result } => {
+                if !self.calendar.feeds.is_empty() {
+                    if month!=self.calendar.view.month {return;}
+                    let Some(feed)=self.calendar.feeds.iter_mut().find(|feed|feed.config==config) else{return;};
+                    feed.month.loading=false;
+                    match result {
+                        Ok(events)=>{feed.month.events=events;feed.month.loaded=Some(month);feed.month.error.clear();}
+                        Err(message)=>feed.month.error=message,
+                    }
+                    self.refresh_calendar_month_status();
+                    return;
+                }
+                let view=&mut self.calendar.view;
+                if month!=view.month || self.calendar.config.as_ref()!=Some(&config){return;}
+                view.loading=false;
+                match result {
+                    Ok(events)=>{view.events=events;view.loaded=Some(month);view.error.clear();}
+                    Err(message)=>view.error=message,
+                }
+            }
+            calendar::Event::Failed { config, message } => {
+                if let Some(feed)=self.calendar.feeds.iter_mut().find(|feed|feed.config==config) {
+                    feed.connected=false;feed.failures=feed.failures.saturating_add(1);feed.error=message.clone();
+                }
+                if self.calendar.config.as_ref()==Some(&config) {
+                    self.calendar.connected = false;
+                    self.calendar.failures = self.calendar.failures.saturating_add(1);
+                    self.calendar.error = message;
+                }
+            }
+        }
+    }
+
+    /// 所有已连接的平台都参与同步，设置标签只决定正在编辑的账号。
+    pub fn calendar_configs(&self) -> Vec<calendar::Config> {
+        if self.calendar.feeds.is_empty() {self.calendar.config.clone().into_iter().collect()}
+        else {self.calendar.feeds.iter().map(|feed|feed.config.clone()).collect()}
+    }
+
+    pub(crate) fn refresh_calendar_month_status(&mut self) {
+        let month=self.calendar.view.month;
+        self.calendar.view.loading=self.calendar.feeds.iter().any(|feed|feed.month.loading);
+        self.calendar.view.loaded=(!self.calendar.feeds.is_empty() && self.calendar.feeds.iter().all(|feed|feed.month.loaded==Some(month))).then_some(month);
+        self.calendar.view.error=self.calendar.feeds.iter().filter(|feed|!feed.month.error.is_empty())
+            .map(|feed|format!("{}：{}",feed.config.provider.label(),feed.month.error)).collect::<Vec<_>>().join("；");
+    }
+
+    pub(crate) fn select_calendar_provider(&mut self, provider: calendar::Provider) {
+        if self.calendar.testing || self.calendar.form.provider == provider { return; }
+        if let Err(error) = calendar::select_provider(provider) {
+            self.calendar.note = error;
+            self.calendar.note_error = true;
+            return;
+        }
+        let feed=self.calendar.feeds.iter().find(|feed|feed.config.provider==provider);
+        self.calendar.config=feed.map(|feed|feed.config.clone());
+        self.calendar.events=feed.map(|feed|feed.events.clone()).unwrap_or_default();
+        self.calendar.connected=feed.is_some_and(|feed|feed.connected);
+        self.calendar.last_sync=feed.map(|feed|feed.last_sync.clone()).unwrap_or_default();
+        self.calendar.failures=feed.map(|feed|feed.failures).unwrap_or_default();
+        self.calendar.error=feed.map(|feed|feed.error.clone()).unwrap_or_default();
+        self.calendar.form=CalendarForm{provider,username:self.calendar.config.as_ref().map(|cfg|cfg.username.clone()).unwrap_or_default(),..Default::default()};
+        self.calendar.note.clear();self.calendar.note_error=false;
+    }
+
+    /// 只移除正在管理的平台，保留其他平台的日程与提醒。
+    pub fn forget_calendar(&mut self) -> Option<calendar::Config> {
+        let old = self.calendar.config.take();
+        if let Some(config)=&old {
+            self.calendar.feeds.retain(|feed|feed.config!=*config);
+            let is_old=|alert:&crate::extras::Alert|alert.meeting.as_ref().is_some_and(|(_,source)|source==config.provider.label());
+            self.alerts.retain(|alert|!is_old(alert));
+            if self.notice.as_ref().is_some_and(is_old){self.notice=None;}
+        }
+        self.calendar.connected = false;
+        self.calendar.events.clear();
+        self.calendar.view.events.clear();
+        self.refresh_calendar_month_status();
+        self.calendar.last_sync.clear();
+        self.calendar.failures = 0;
+        self.calendar.error.clear();
+        self.calendar.note.clear();
+        old
+    }
+
+    /// 外壳同步收信线程时读账号清单（不含任何凭据）。
+    pub fn mail_accounts(&self) -> &[mail::Account] {
+        &self.mail.accounts
+    }
+
+    /// 账号增删或开关变化后：落盘并让外壳重新对齐收信线程。
+    pub(crate) fn mail_accounts_changed(&mut self) {
+        mail::save_accounts(&self.mail.accounts);
+        self.pending.push(Cmd::MailSync);
+    }
+
+    /// 录制/截图用的系统页样例数据。
+    #[cfg(feature = "record")]
+    pub fn system_demo(&mut self) {
+        self.system.demo();
+    }
+
+    /// 录制/截图用的邮件样例（只在 `record` feature 下编译）。
+    ///
+    /// `WINDOWISLE_MAIL_DEMO=1|code` 面板带验证码，`=list` 只列邮件，`=fail` 用假授权码走一次
+    /// 「测试连接失败」，方便在没有真实邮箱时验收失败路径。
+    #[cfg(feature = "record")]
+    pub fn mail_demo(&mut self) {
+        use mail::{Account, Item, Provider, Status};
+        let mode = std::env::var("WINDOWISLE_MAIL_DEMO").unwrap_or_default();
+        self.settings_tab = 7;
+        if mode == "fail" {
+            self.mail.form.provider = Provider::Qq;
+            self.mail.form.email = "test@qq.com".into();
+            self.mail.form.password = "invalid-auth-code".into();
+            self.mail.note = "test@qq.com：正在测试连接…".into();
+            self.pending.push(Cmd::MailTest(
+                Account { email: "test@qq.com".into(), provider: Provider::Qq, enabled: true },
+                "invalid-auth-code".into(),
+            ));
+            return;
+        }
+        self.mail.accounts = vec![
+            Account { email: "tang@qq.com".into(), provider: Provider::Qq, enabled: false },
+            Account { email: "hi@icloud.com".into(), provider: Provider::ICloud, enabled: false },
+        ];
+        for a in &self.mail.accounts {
+            self.mail.status.insert(a.email.clone(), Status::Ready);
+        }
+        // 会议演示：开始时间设成 10 分钟后，正好落在默认 15 分钟提前量里，
+        // 启动即触发一次「会议提醒」。
+        let mstart = chrono::Local::now().timestamp() + 600;
+        let mat = chrono::DateTime::from_timestamp(mstart, 0)
+            .map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
+            .unwrap_or_default();
+        let rows = [
+            (
+                "GitHub",
+                "[GitHub] Please verify your device",
+                "09:41",
+                Some("482913"),
+                "We noticed a sign-in attempt from a new device. Enter 482913 to finish signing in. If this wasn't you, secure your account now.",
+                None,
+            ),
+            (
+                "Apple",
+                "Your Apple ID verification code",
+                "09:38",
+                None,
+                "Your Apple ID code is 573104. Don't share it with anyone. If you didn't request it, you can ignore this message.",
+                None,
+            ),
+            (
+                "腾讯企业邮",
+                "会议邀请：周五方案评审",
+                "09:12",
+                None,
+                "本周五 14:30 在三楼会议室评审 v0.5.5 方案，请提前十分钟到场。会议邀请见附件。",
+                Some((mstart, mat)),
+            ),
+            (
+                "顺丰速运",
+                "您的快件已到达菜鸟驿站",
+                "08:57",
+                None,
+                "您的快件已到达菜鸟驿站（望京 SOHO T1 店），请凭取件码 6-3-2 在 20:00 前领取。",
+                None,
+            ),
+        ];
+        let with_code = mode != "list";
+        self.mail.recent = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (from, subject, time, code, summary, meeting))| Item {
+                account: "tang@qq.com".into(),
+                from: (*from).into(),
+                subject: (*subject).into(),
+                time: (*time).into(),
+                code: if with_code { (*code).map(str::to_string) } else { None },
+                summary: (*summary).into(),
+                links: Vec::new(),
+                meeting: meeting.as_ref().map(|(start, at)| mail::Meeting { all_day:false, end:None, title: "周五方案评审".into(), start: *start, at: at.clone(), uid: "demo-ics-1".into() }),
+                uid: 900 - i as u32,
+            })
+            .collect();
+        self.mail.note = "tang@qq.com：连接成功".into();
+        self.page = 5;
+        self.dots_target();
+    }
+
+    /// 录制/截图用的日程样例（只在 `record` feature 下编译）。
+    ///
+    /// `WINDOWISLE_CAL_DEMO=paste|fail|connected|alert`。
+    #[cfg(feature = "record")]
+    pub fn calendar_demo(&mut self) {
+        use calendar::Provider;
+        let mode = std::env::var("WINDOWISLE_CAL_DEMO").unwrap_or_default();
+        self.calendar.form.provider = Provider::Feishu;
+        self.calendar.form.username = "demo***@feishu.example".into();
+        self.settings_tab = 8;
+        self.open_settings();
+        self.settings.calendar_prompt = false;
+        let later = |secs: i64| chrono::Local::now().timestamp() + secs;
+        let label = |ts: i64| {
+            chrono::DateTime::from_timestamp(ts, 0)
+                .map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
+                .unwrap_or_default()
+        };
+        let demo_cfg = calendar::Config {
+            provider: Provider::Feishu,
+            username: "demo***@feishu.example".into(),
+            href: Some("https://caldav.feishu.cn/calendars/8f3c2d7a-1111-2222-3333-444455556666/".into()),
+            server: None,
+        };
+        match mode.as_str() {
+            "paste" => {
+                self.calendar.form.username =
+                    "服务器地址：https://caldav.feishu.cn/calendars/\n用户名：demo***@feishu.example\n密码：demo-pass-123".into();
+                if let Some((u, p)) = calendar::parse_paste(&self.calendar.form.username) {
+                    self.calendar.form.username = u;
+                    self.calendar.form.password = p;
+                    self.calendar.note = "已从粘贴内容拆出用户名和密码，服务器地址已按平台填好".into();
+                }
+            }
+            "fail" => {
+                self.calendar.form.password = "demo-pass-123".into();
+                self.calendar.note = calendar::human_error(Provider::Feishu, Some(401));
+                self.calendar.note_error = true;
+            }
+            "connected" => {
+                let a = later(3600);
+                let b = later(6 * 3600);
+                self.calendar.form.password = "demo-pass-123".into();
+                self.calendar.events = vec![
+                    mail::Meeting { all_day:false, end:None, title: "产品评审".into(), start: a, at: label(a), uid: "demo-cal-1".into() },
+                    mail::Meeting { all_day:false, end:None, title: "设计周会".into(), start: b, at: label(b), uid: "demo-cal-2".into() },
+                ];
+                self.calendar.config = Some(demo_cfg.clone());
+                self.calendar.connected = true;
+                self.calendar.last_sync = calendar::now_label();
+                self.calendar.note.clear();
+                self.calendar.note_error = false;
+            }
+            "alert" => {
+                let s = later(600);
+                self.calendar.events =
+                    vec![mail::Meeting { all_day:false, end:None, title: "飞书日程：产品评审".into(), start: s, at: label(s), uid: "demo-cal-alert".into() }];
+                self.calendar.config = Some(demo_cfg.clone());
+                self.calendar.connected = true;
+                self.calendar.last_sync = calendar::now_label();
+                self.settings_open = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// v0.5.4：把系统音量与蓝牙设备状态同步进界面；只在连接/断开时提示一次。
+    fn sync_device(&mut self, env: &Env) {
+        if self.t >= self.volume_quiet_until {
+            if let Some(v) = env.volume {
+                self.volume_ui = Some(v);
+            }
+        }
+        if !env.bt_ready { return; }
+        // 只把首次完整扫描作为基线，之后的连接变化都应提示。
+        if !self.bt_initialized {
+            self.bt_initialized = true;
+            self.bt_shown = env.bt.clone();
+            return;
+        }
+        let connected: Vec<_> = env.bt.iter().filter(|d| !self.bt_shown.iter().any(|old| old.id == d.id)).cloned().collect();
+        let disconnected: Vec<_> = self.bt_shown.iter().filter(|d| !env.bt.iter().any(|new| new.id == d.id)).cloned().collect();
+        for device in &connected { self.bluetooth_alert(device, true); }
+        for device in &disconnected { self.bluetooth_alert(device, false); }
+        self.bt_shown = env.bt.clone();
+    }
+
+    /// 距离上次交互的秒数（小精灵出现的依据）。
+    pub fn idle_for(&self) -> f64 {
+        self.system_idle.unwrap_or(self.t - self.last_input)
+    }
+
+    pub fn show_page(&mut self,page:usize) {
+        if !self.settings.visible_pages[page] {
+            self.settings_tab=PAGE_SETTINGS_TABS[page];
+            self.open_settings();
+            return;
+        }
+        self.notice=None;
+        self.go(page,1.0);
+        self.open=true; self.forced_open_until=self.t+4.0;
+        self.w.tune(OPEN_W.0,OPEN_W.1);self.h.tune(OPEN_H.0,OPEN_H.1);
+        self.w.target=PW;self.h.target=self.expanded_height();
+    }
+
+    /// 命令面板用：当前可见页面的顺序与说明。
+    pub fn palette_snapshot(&self) -> crate::command_palette::Snapshot {
+        let pages = self
+            .settings
+            .page_order
+            .iter()
+            .copied()
+            .filter(|page| self.settings.visible_pages[*page])
+            .map(|index| crate::command_palette::PageInfo {
+                index,
+                name: PAGE_NAMES[index],
+                description: PAGE_DESCRIPTIONS[index],
+            })
+            .collect();
+        crate::command_palette::Snapshot {
+            pages,
+            clipboard_enabled: self.settings.clipboard_enabled,
+            clipboard_paused: self.settings.clipboard_paused,
+            focus_running: self.pomo.running,
+            timer_running: self.timer.running,
+            timer_remaining: match self.timer.mode {
+                TimerMode::Countdown => self.timer.remaining,
+                TimerMode::Stopwatch => self.timer.elapsed,
+            },
+            stay_awake: self.settings.stay_awake,
+            weather_enabled: self.settings.weather_enabled,
+            pins: 0,
+            media_title: self.media.title.clone(),
+            media_source: self.media.source.clone(),
+            media_playing: self.media.playing,
+        }
+    }
+
+    /// 静音某个应用的通知（写入应用通知开关并持久化）。
+    pub fn mute_notification_app(&mut self, source_id: &str, name: &str) -> bool {
+        let source_id = source_id.trim();
+        let name = name.trim();
+        if let Some(entry) = self.notification_apps.items.iter_mut().find(|(id, app_name, _)| {
+            (!source_id.is_empty() && id.eq_ignore_ascii_case(source_id))
+                || (!name.is_empty() && app_name.eq_ignore_ascii_case(name))
+        }) {
+            if !entry.2 {
+                return false;
+            }
+            entry.2 = false;
+            self.notification_apps.save();
+            return true;
+        }
+        if source_id.is_empty() && name.is_empty() {
+            return false;
+        }
+        let id = if source_id.is_empty() { name.to_string() } else { source_id.to_string() };
+        self.notification_apps.items.push((id, name.to_string(), false));
+        self.notification_apps.save();
+        true
+    }
+
+    pub fn processes_event(&mut self, snapshot: crate::processes::Snapshot) {
+        self.processes = snapshot;
+    }
+
+    /// 进程页是否正在前台显示（外壳据此启停采样线程）。
+    pub fn process_page_active(&self) -> bool {
+        self.open && self.page == 11
+    }
+
+    #[cfg(feature = "record")]
+    pub fn process_sort_memory_demo(&mut self) {
+        self.process_sort = crate::processes::ProcessSort::Memory;
+    }
+
+    #[cfg(feature = "record")]
+    pub fn processes_demo(&mut self) {
+        self.processes = crate::processes::Snapshot {
+            items: [
+                ("msedge.exe", 8.2, 1_240_000_000u64),
+                ("windowisle.exe", 5.4, 188_000_000),
+                ("Code.exe", 3.9, 720_000_000),
+                ("explorer.exe", 1.8, 240_000_000),
+                ("WeChat.exe", 1.2, 410_000_000),
+                ("Spotify.exe", 0.9, 260_000_000),
+                ("System", 0.6, 20_000_000),
+                ("svchost.exe", 0.3, 64_000_000),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, cpu, memory))| crate::processes::Process {
+                name: name.into(),
+                pid: 1000 + index as u32,
+                cpu,
+                memory,
+            })
+            .collect(),
+            total: 218,
+            cores: 12,
+        };
+    }
+
+    /// 通知历史快照（按时段渲染用）与未读数。
+    pub fn notifications_snapshot(&self) -> Vec<crate::notifications::Notification> {
+        self.notifications.items.clone()
+    }
+
+    pub fn notifications_unread(&self) -> usize {
+        self.notifications.unread()
+    }
+
+    pub fn notifications_revision(&self) -> u64 {
+        self.notifications_revision
+    }
+
+    pub fn notifications_mark_seen(&mut self) {
+        self.notifications.mark_seen();
+        self.notifications_revision = self.notifications_revision.wrapping_add(1);
+    }
+
+    pub fn notifications_delete(&mut self, id: &str) {
+        self.notifications.remove(id);
+        self.notifications_revision = self.notifications_revision.wrapping_add(1);
+    }
+
+    pub fn notifications_clear(&mut self) {
+        self.notifications.clear();
+        self.notifications_revision = self.notifications_revision.wrapping_add(1);
+    }
+
+    /// 请求外壳打开通知历史面板。
+    pub fn open_notifications_panel(&mut self) {
+        self.pending.push(Cmd::OpenNotifications);
+    }
+
+    /// 当前小时是否处于免打扰时段；结束时间小于开始时间时按跨午夜处理。
+    pub(crate) fn dnd_active(&self, hour: u32) -> bool {
+        if !self.settings.dnd_enabled {
+            return false;
+        }
+        let start = self.settings.dnd_start.min(23);
+        let end = self.settings.dnd_end.min(23);
+        if start == end {
+            return false;
+        }
+        if start < end {
+            hour >= start && hour < end
+        } else {
+            hour >= start || hour < end
+        }
+    }
+
+    pub(crate) fn dnd_active_now(&self) -> bool {
+        use chrono::Timelike;
+        self.dnd_active(chrono::Local::now().hour())
+    }
+
+    /// 后台线程送来的音频频谱；只在设置开启时使用。
+    pub fn audio_spectrum(&mut self, spectrum: crate::audio::Spectrum) {
+        self.spectrum = spectrum;
+        self.spectrum_at = self.t;
+    }
+
+    #[cfg(feature = "record")]
+    pub fn spectrum_demo(&mut self) {
+        self.spectrum = crate::audio::Spectrum {
+            bands: [0.18, 0.42, 0.68, 0.92, 0.74, 0.55, 0.38, 0.62, 0.44, 0.28, 0.20, 0.12],
+            level: 0.46,
+        };
+        self.spectrum_at = self.t;
+    }
+
+    fn draw_playback_bars(&self, c: &Card, x: f32, y: f32) {
+        if self.settings.audio_visualizer && self.media.playing && self.spectrum.level > 0.006 {
+            crate::paint::spectrum(c, x, y, 20.0, 13.0, &self.spectrum.bands, theme::WHITE);
+        } else {
+            crate::paint::playback_bars(c, x, y, self.t, self.media.playing, theme::WHITE);
+        }
+    }
+
+    /// 天气服务事件：失败时保留上一次成功数据，只记录错误。
+    pub fn weather_event(&mut self, event: crate::weather::Event) {
+        match event {
+            crate::weather::Event::Loading => self.weather.loading = true,
+            crate::weather::Event::Loaded(weather) => {
+                self.weather.current = Some(weather);
+                self.weather.error = None;
+                self.weather.loading = false;
+            }
+            crate::weather::Event::Failed(error) => {
+                self.weather.error = Some(error);
+                self.weather.loading = false;
+            }
+        }
+    }
+
+    /// Agent 任务事件（main.rs 每帧调用）：更新会话清单并判定提醒。
+    pub fn dsh_event(&mut self, event: crate::dsh_tasks::Event) {
+        match event {
+            crate::dsh_tasks::Event::Sessions(list) => {
+                let notices = self.dsh.watch.observe(&list, self.t);
+                let now = self.t;
+                // 收起态的对勾只在「刚完成」时亮 60 秒：之前见过这个会话、当时还没
+                // 全部完成，现在全部完成了才记时刻；已记的不覆盖（DSH 完成后继续写
+                // 文件不会把 60 秒重新计时）。启动时读到的早已完成的会话不亮。
+                let before: std::collections::HashMap<String, bool> =
+                    self.dsh.sessions.iter().map(|s| (s.id.clone(), s.progress().all_done())).collect();
+                for session in &list {
+                    if session.progress().all_done() {
+                        if before.get(&session.id) == Some(&false) {
+                            self.dsh.done_at.entry(session.id.clone()).or_insert(now);
+                        }
+                    } else {
+                        self.dsh.done_at.remove(&session.id);
+                    }
+                }
+                self.dsh.done_at.retain(|id, _| list.iter().any(|s| &s.id == id));
+                if let Some(selected) = &self.dsh.selected {
+                    if !list.iter().any(|s| &s.id == selected) {
+                        self.dsh.selected = None;
+                    }
+                }
+                self.dsh.sessions = list;
+                self.dsh_notify(notices);
+            }
+            crate::dsh_tasks::Event::Status(status) => {
+                // 第一次变 Ready 且从未自动打开过任务页：打开并提示一次。
+                let turning_ready = !matches!(self.dsh.status, Some(crate::dsh_tasks::Status::Ready { .. }))
+                    && matches!(status, crate::dsh_tasks::Status::Ready { .. });
+                self.dsh.status = Some(status);
+                if turning_ready && !self.settings.dsh_page_auto_shown {
+                    self.settings.dsh_page_auto_shown = true;
+                    self.settings.save();
+                    if self.settings.visible_pages.len() > 12 {
+                        self.settings.visible_pages[12] = true;
+                    }
+                    self.say("检测到 DeepSeek Harness，已打开 Agent 任务页");
+                }
+            }
+        }
+    }
+
+    /// 提醒落地（文案见设计文档 5.1）。
+    fn dsh_notify(&mut self, notices: Vec<crate::dsh_tasks::Notice>) {
+        for notice in notices {
+            match notice {
+                crate::dsh_tasks::Notice::AllDone { title, total, last, .. } => {
+                    if !self.settings.dsh_notify_all {
+                        continue;
+                    }
+                    let last: String = last.chars().take(40).collect();
+                    let body = if self.settings.dsh_notify_detail && !last.is_empty() {
+                        format!("{title} · 共 {total} 项 · 最后完成：{last}")
+                    } else {
+                        format!("{title} · 共 {total} 项")
+                    };
+                    let system = self.settings.dsh_notify_system && !self.dnd_active_now();
+                    self.alert("全部任务完成", body, DSH_PAGE, system);
+                }
+                crate::dsh_tasks::Notice::Batch { title, count, .. } => {
+                    if !self.settings.dsh_notify_each {
+                        continue;
+                    }
+                    self.alert("任务完成", format!("完成了 {count} 项 · {title}"), DSH_PAGE, false);
+                }
+                crate::dsh_tasks::Notice::TaskDone { title, content, .. } => {
+                    if !self.settings.dsh_notify_each {
+                        continue;
+                    }
+                    let content: String = content.chars().take(40).collect();
+                    self.alert("任务完成", format!("{content} · {title}"), DSH_PAGE, false);
+                }
+            }
+        }
+    }
+
+    /// 收起态显示的会话（设计 7.2）：最近更新、未完成且 10 分钟内活跃，
+    /// 或全部完成且完成未满 60 秒（显示对勾后收回）。
+    pub(crate) fn dsh_resident(&self) -> Option<&crate::dsh_tasks::Session> {
+        if !self.settings.dsh_enabled || !self.settings.dsh_resident {
+            return None;
+        }
+        // 「多久没更新」要用墙上时间和文件修改时间比；「完成多久」用 App::t。
+        let (now, wall) = (self.t, crate::dsh_tasks::unix_now());
+        self.dsh.sessions.iter().find(|session| {
+            if session.progress().all_done() {
+                self.dsh
+                    .done_at
+                    .get(&session.id)
+                    .is_some_and(|at| now - *at <= 60.0)
+            } else {
+                wall - session.updated <= 600
+            }
+        })
+    }
+
+    /// 会话标签翻页基址（越界收回）。
+    pub(crate) fn dsh_sessions_tab_base(&mut self) -> usize {
+        // 只在越界时收回到最后一组；4、5 个会话时第二组也能翻到。
+        let len = self.dsh.sessions.len();
+        if len == 0 {
+            self.dsh.sessions_tab_base = 0;
+        } else if self.dsh.sessions_tab_base >= len {
+            self.dsh.sessions_tab_base = (len - 1) / 3 * 3;
+        }
+        self.dsh.sessions_tab_base
+    }
+
+    /// 当前选中会话的任务数（滚轮上限用）。
+    pub(crate) fn dsh_selected_len(&self) -> usize {
+        let selected = self.dsh.selected.as_deref();
+        self.dsh
+            .sessions
+            .iter()
+            .find(|s| Some(s.id.as_str()) == selected)
+            .or_else(|| self.dsh.sessions.first())
+            .map(|s| s.tasks.len())
+            .unwrap_or(0)
+    }
+
+    /// 下发给数据服务的配置（main.rs 每帧比较）。
+    pub fn dsh_config(&self) -> crate::dsh_tasks::Config {
+        crate::dsh_tasks::Config {
+            enabled: self.settings.dsh_enabled,
+            dir: if self.settings.dsh_dir.trim().is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(self.settings.dsh_dir.trim()))
+            },
+        }
+    }
+
+    /// 内存清理事件：手动结果给 toast，自动完成的失败不打扰。
+    pub fn mem_clean_event(&mut self, event: crate::mem_clean::Event) {
+        match event {
+            crate::mem_clean::Event::Finished { manual, freed_bytes, duration } => {
+                self.mem.busy = false;
+                self.mem.last_error = None;
+                if let Some(freed) = freed_bytes {
+                    self.mem.last = Some((freed, duration, std::time::Instant::now()));
+                }
+                if manual {
+                    match freed_bytes {
+                        Some(freed) if freed >= 0 => {
+                            self.say(format!("已释放 {} 内存", crate::perf::format_bytes(freed as u64)));
+                        }
+                        Some(_) => self.say("清理完成，可用内存暂无变化"),
+                        None => self.say(format!("清理完成（{:.1} 秒）", duration.as_secs_f32())),
+                    }
+                } else {
+                    self.say("已自动清理内存");
+                }
+            }
+            crate::mem_clean::Event::Failed { manual, error } => {
+                self.mem.busy = false;
+                self.mem.last_error = Some(error.clone());
+                if manual {
+                    // 手动失败（含安装失败）：挂起的懒安装清理作废，别等连上后又清一次。
+                    self.mem.pending_clean = false;
+                    self.mem.installing = false;
+                    self.say(error);
+                }
+            }
+            crate::mem_clean::Event::Connected(connected) => {
+                self.mem.connected = connected;
+                if connected {
+                    self.mem.installed = true;
+                    self.mem.installing = false;
+                    self.mem.unavailable = None;
+                } else {
+                    self.mem.busy = false;
+                }
+            }
+            crate::mem_clean::Event::Unavailable { installed, reason } => {
+                self.mem.installed = installed;
+                self.mem.unavailable = Some(reason);
+            }
+            crate::mem_clean::Event::Outdated(outdated) => {
+                self.mem.outdated = outdated;
+            }
+        }
+    }
+
+    /// 手动清理开始（由外壳在启动清理线程时回调）：置忙并收起提示。
+    pub fn mem_clean_started(&mut self) {
+        self.mem.busy = true;
+        self.mem.last_error = None;
+    }
+
+    pub fn mem_connected(&self) -> bool {
+        self.mem.connected
+    }
+
+    pub fn set_pending_clean(&mut self, pending: bool) {
+        self.mem.pending_clean = pending;
+    }
+
+    pub fn take_pending_clean(&mut self) -> bool {
+        std::mem::replace(&mut self.mem.pending_clean, false)
+    }
+
+    pub fn mem_installing(&self) -> bool {
+        self.mem.installing
+    }
+
+    /// 安装进程已启动（UAC 已同意）：界面显示「正在安装」。
+    pub fn mem_install_started(&mut self) {
+        self.mem.installing = true;
+        self.mem.last_error = None;
+    }
+
+    /// 收起态岛上的内存圆环：占用比例弧 + 中心百分比，点击立即清理。
+    pub(crate) fn draw_memory_bar(&mut self, c: &Card, local_cx: f32, layout: &Layout) {
+        use std::f32::consts::{FRAC_PI_2, TAU};
+        let Some(x) = layout.x[bar::MEMORY] else { return };
+        let x = local_cx + x;
+        let fraction = (self.system.memory.pos / 100.0).clamp(0.0, 1.0);
+        let (used, total) = self.system.perf.memory.unwrap_or((0, 0));
+
+        // 颜色：占用越高越警示；清理中呼吸。
+        let mut color = if fraction >= 0.9 { theme::RED } else if fraction >= 0.75 { theme::YELLOW } else { theme::SOFT_GREEN };
+        if self.mem.busy {
+            let breathe = (0.5 + 0.5 * (self.t * 3.2).sin()) as f32;
+            color = crate::paint::alpha(color, 0.35 + 0.65 * breathe);
+        }
+        let track = Color32::from_gray(60);
+        let r = 7.0;
+        let stroke = 2.0;
+        let start = -FRAC_PI_2;
+        let end = start + TAU * fraction;
+        c.arc(x, 15.0, r, end, start + TAU, stroke, track);
+        if fraction > 0.01 {
+            c.arc(x, 15.0, r, start, end, stroke, color);
+        }
+        let label = if self.mem.busy { "···" } else { &format!("{:.0}", fraction * 100.0) };
+        c.text(x, 17.3, label, 6.0, W::Bold, theme::WHITE, H::Center);
+
+        let summary = if self.mem.installing {
+            "正在安装清理服务…".to_string()
+        } else if !self.mem.connected {
+            format!(
+                "{}\n点击{}（需要一次管理员确认）",
+                self.mem.unavailable.as_deref().unwrap_or("清理服务未连接"),
+                self.mem.install_label(),
+            )
+        } else if self.mem.busy {
+            "正在清理内存…".to_string()
+        } else {
+            let tip = format!(
+                "物理内存：已用 {} / 共 {}\n点击立即清理",
+                crate::perf::format_bytes(used),
+                crate::perf::format_bytes(total),
+            );
+            match self.mem.last {
+                Some((freed, _, at)) if at.elapsed().as_secs() < 600 => {
+                    format!("{tip}\n上次清理释放 {}", crate::perf::format_bytes(freed.max(0) as u64))
+                }
+                _ => tip,
+            }
+        };
+        if c.hit(x - 9.0, 3.0, 18.0, 24.0, "memory-clean").on_hover_text(summary).clicked() {
+            self.pending.push(Cmd::CleanMemory);
+        }
+    }
+
+    /// 设置里配置的城市列表；为空时回退到默认城市。
+    pub fn weather_cities(&self) -> Vec<String> {
+        let cities = crate::weather::parse_cities(&self.settings.weather_city);
+        if cities.is_empty() {
+            vec![crate::weather::DEFAULT_CITY.to_string()]
+        } else {
+            cities
+        }
+    }
+
+    pub fn weather_selected_city(&self) -> String {
+        let cities = self.weather_cities();
+        let index = self.weather_city_index % cities.len();
+        cities[index].clone()
+    }
+
+    /// 在城市列表中向前切换，并请求刷新。
+    pub fn weather_cycle_city(&mut self) {
+        let count = self.weather_cities().len();
+        if count <= 1 {
+            return;
+        }
+        self.weather_city_index = (self.weather_city_index + 1) % count;
+        self.weather.loading = true;
+        self.weather.error = None;
+    }
+
+    pub fn request_weather_refresh(&mut self) {
+        self.weather.loading = true;
+        self.pending.push(Cmd::WeatherRefresh);
+    }
+
+    /// 录制/截图用：切到多日预报视图。
+    #[cfg(feature = "record")]
+    pub fn weather_days_demo(&mut self) {
+        self.weather_days = true;
+    }
+
+    /// 录制/截图用的天气样例数据。
+    #[cfg(feature = "record")]
+    pub fn weather_demo(&mut self) {
+        self.settings.weather_city = "北京、上海、杭州".into();
+        self.weather_city_index = 0;
+        let now = {
+            use chrono::TimeZone;
+            chrono::Local::now()
+                .date_naive()
+                .and_hms_opt(10, 28, 0)
+                .and_then(|at| chrono::Local.from_local_datetime(&at).single())
+                .map(|time| time.timestamp())
+                .unwrap_or_else(|| chrono::Local::now().timestamp())
+        };
+        self.weather.current = Some(crate::weather::Weather {
+            city: "北京".into(),
+            latitude: 39.9,
+            longitude: 116.4,
+            temperature: 11.2,
+            apparent: Some(9.0),
+            humidity: Some(46),
+            wind_kmh: Some(12.0),
+            code: 2,
+            is_day: true,
+            high: Some(16.0),
+            low: Some(3.0),
+            precip_chance: Some(10),
+            updated_at: now,
+            hourly: vec![
+                ("现在", 11.2, 2, Some(10), true),
+                ("16时", 13.0, 2, Some(10), true),
+                ("17时", 12.0, 0, Some(0), false),
+                ("18时", 10.0, 2, Some(0), false),
+                ("19时", 9.0, 61, Some(45), false),
+                ("20时", 8.0, 61, Some(55), false),
+            ].into_iter().map(|(label, temperature, code, precip_chance, is_day)| crate::weather::Hour { label: label.into(), temperature, code, precip_chance, is_day }).collect(),
+            days: vec![
+                crate::weather::Day { label: "今天".into(), code: 2, high: Some(16.0), low: Some(3.0), precip_chance: Some(10) },
+                crate::weather::Day { label: "明天".into(), code: 61, high: Some(13.0), low: Some(5.0), precip_chance: Some(60) },
+                crate::weather::Day { label: "周四".into(), code: 3, high: Some(11.0), low: Some(4.0), precip_chance: Some(20) },
+            ],
+            sunrise: Some("06:52".into()),
+            sunset: Some("16:58".into()),
+            aqi: Some(crate::weather::Aqi { value: 42, pm2_5: Some(18.0), pm10: Some(31.0) }),
+        });
+        self.weather.error = None;
+        self.weather.loading = false;
+    }
+
+    /// 命令面板用：开始一段指定分钟数的倒计时，并打开计时页。
+    pub fn start_countdown(&mut self, minutes: u32) {
+        self.timer.set_preset(minutes);
+        if !self.timer.running {
+            self.timer.toggle();
+        }
+        self.show_page(9);
+    }
+
+    /// 命令面板用：开始/暂停当前计时；返回是否正在计时。
+    pub fn toggle_timer(&mut self) -> bool {
+        self.timer.toggle();
+        self.timer.running
+    }
+
+    pub fn reset_timer(&mut self) {
+        self.timer.reset();
+    }
+
+    /// 录制/截图用：让计时页显示一个运行中的倒计时。
+    #[cfg(feature = "record")]
+    pub fn timer_demo(&mut self) {
+        self.timer.set_preset(15);
+        self.timer.remaining = 9.0 * 60.0 + 42.0;
+        self.timer.running = true;
+    }
+
+    /// 命令面板用：开始/暂停专注计时，并把岛体切到专注页。
+    pub fn toggle_focus(&mut self) {
+        if self.pomo.remaining <= 0.0 {
+            self.pomo.remaining = self.phase_secs(self.pomo.phase);
+        }
+        self.pomo.running = !self.pomo.running;
+        self.show_page(1);
+    }
+    /// 外部（音量快捷键）更新岛体音量 HUD 的数值。
+    pub fn show_volume_ui(&mut self, level: u32, muted: bool) {
+        self.volume_ui = Some((level.min(100), muted));
+    }
+
+    /// 设置搜索：返回匹配的标签，并在当前标签不匹配时跳到第一个结果。
+    pub fn apply_settings_query(&mut self) -> Vec<usize> {
+        let matched = crate::extras::settings_matches(&self.settings_query);
+        if !self.settings_query.trim().is_empty() {
+            if let Some(first) = matched.first() {
+                if !matched.contains(&self.settings_tab) {
+                    self.settings_tab = *first;
+                }
+            }
+        }
+        matched
+    }
+
+    pub fn open_settings(&mut self){
+        if !self.settings_open {
+            self.settings_query.clear();
+        }
+        self.settings_open=true;
+        self.settings_focus_requested=true;
+    }
+    /// 命令面板用：直接打开设置并切到指定标签。
+    pub fn open_settings_tab(&mut self, tab: usize) {
+        self.settings_tab = tab.min(14);
+        self.open_settings();
+    }
+    pub fn open_settings_category(&mut self,category:usize){
+        self.settings_category=category.min(3);
+        if category==0 || category>=3 {self.settings_tab=if category==0{0}else{6};self.open_settings();return;}
+        let page=if category==1{2}else{1};
+        self.show_page(page);
+        if self.settings.visible_pages[page] && (category==1 || category==2) {self.subpage=Some(page);}
+    }
+    pub fn page(&self) -> usize {
+        self.page
+    }
+
+    pub(crate) fn set_page_visible(&mut self,page:usize,visible:bool) {
+        if !visible && self.settings.visible_pages.iter().filter(|enabled|**enabled).count()==1
+            && self.settings.visible_pages[page] { return; }
+        self.settings.visible_pages[page]=visible;
+        if !self.settings.visible_pages[self.page] {
+            if let Some(first)=self.settings.page_order.iter().copied().find(|page|self.settings.visible_pages[*page]) { self.go(first,1.0); }
+        }
+    }
+
+    fn navigate_page(&mut self,next:bool) {
+        let position=self.settings.page_order.iter().position(|page|*page==self.page).unwrap();
+        for offset in 1..=PAGE_NAMES.len() {
+            let page=self.settings.page_order[(position+if next {offset}else{PAGE_NAMES.len()-offset})%PAGE_NAMES.len()];
+            if self.settings.visible_pages[page] {
+                self.go(page,if next {1.0}else{-1.0});
+                break;
+            }
+        }
+    }
+
+    pub fn is_editing(&self) -> bool {
+        self.adding || self.editing.is_some() || self.task_dialog.is_some() || self.calendar.draft.is_some() || self.timer.entry.is_some()
+    }
+
+    pub fn foreground_changed(&mut self) {
+        self.hover_lock=true;
+        if self.adding && self.buf.trim().is_empty(){self.cancel_edit();}
+        // 切到别的窗口时，已键入的倒计时时长照常生效。
+        if self.timer.entry.is_some(){self.timer.commit_entry();}
+    }
+
+    /// 带过渡地切到某页。`dir` > 0 表示内容从右侧进入。
+    pub(crate) fn go(&mut self, page: usize, dir: f32) {
+        if page == self.page || !self.settings.visible_pages[page] { return; }
+        self.subpage=None;
+        // 连点：上一段过渡还没结束时，以当前页为起点重新开始，位移速度保留。
+        self.page_from = self.page;
+        self.page = page;
+        if page==CALENDAR_PAGE {self.request_calendar_month(false);}
+        if page==10 && self.settings.weather_enabled && self.weather.current.is_none() && !self.weather.loading {
+            self.pending.push(Cmd::WeatherRefresh);
+            self.weather.loading=true;
+        }
+        self.page_dir = dir;
+        self.page_t0 = self.t;
+        self.slide.pos = dir * PAGE_SLIDE + if self.page_e() < 0.4 { self.slide.pos * 0.3 } else { 0.0 };
+        self.slide.target = 0.0;
+        if !crate::bar_layout::animations_enabled() {
+            // 关闭岛体动效时直接落到新页面，不做滑动和缓冲。
+            self.page_t0 = self.t - 10.0;
+            self.slide.snap(0.0);
+        }
+        self.dots_target();
+        self.cancel_edit();
+    }
+
+    fn page_e(&self) -> f32 {
+        (self.t - self.page_t0) as f32
+    }
+
+    fn dots_target(&mut self) {
+        for (i, d) in self.dots.iter_mut().enumerate() {
+            d.target = if i == self.page { 16.0 } else { 4.0 };
+        }
+    }
+
+    pub(crate) fn cancel_edit(&mut self) {
+        self.adding = false;
+        self.editing = None;
+        self.task_dialog=None;
+        self.calendar.draft=None;
+        self.timer.entry=None;
+        self.buf.clear();
+        self.todo_input_focused=false;
+    }
+
+    fn island_lyrics_active(&self)->bool {
+        self.settings.island_lyrics && self.settings.visible_pages[0] && self.media.is_music()
+            && !self.browser_minimal_active
+            && self.ly.key==format!("{}|{}|{:.0}",self.media.title,self.media.artist,self.media.duration)
+            && self.ly.lyrics.as_ref().is_some_and(|lyrics|lyrics.synced && lyrics.lines.iter().any(|line|!line.text.trim().is_empty()))
+    }
+    pub(crate) fn compact_notices(&self)->bool {self.island_lyrics_active()&&!self.open&&!self.notice.as_ref().is_some_and(|a|a.meeting.is_some())}
+
+    /// 换句、分段和展开高亮共用时间调整；正数延后，负数提前。
+    pub(crate) fn lyric_position(&self)->f32 {(self.media.position-self.settings.lyric_delay_ms as f64/1000.0)as f32}
+
+    pub(crate) fn island_lyric(&self) -> Option<(usize,&str)> {
+        if !self.island_lyrics_active(){return None;}
+        if self.ly.key!=format!("{}|{}|{:.0}",self.media.title,self.media.artist,self.media.duration) {return None;}
+        let lyrics=self.ly.lyrics.as_ref().filter(|lyrics|lyrics.synced)?;
+        let index=lyrics.index_at(self.lyric_position())?;
+        let text=lyrics.lines.get(index)?.text.trim();
+        (!text.is_empty()).then_some((index,text))
+    }
+
+    fn update_island_lyric_layout(&mut self,ctx:&egui::Context) {
+        if !self.island_lyrics_active(){self.island_lyric_layout=None;return;}
+        let current=self.island_lyric();
+        let text=if let Some((_,line))=current {line}
+            else if self.ly.loading || self.ly.key!=format!("{}|{}|{:.0}",self.media.title,self.media.artist,self.media.duration) {"正在查找歌词…"}
+            else if let Some(lyrics)=&self.ly.lyrics {
+                if !lyrics.synced {"暂无同步歌词"}
+                else if lyrics.index_at(self.lyric_position()).is_none() {"前奏"}
+                else {"间奏"}
+            } else {""};
+        let ink=if current.is_some(){theme::WHITE}else{theme::GRAY};
+        let layout=|text:String| {
+            let mut job=egui::text::LayoutJob::simple(text,theme::font(11.0,W::Semibold),ink,LYRIC_BAR_W-80.0);
+            job.halign=egui::Align::Center;
+            job.wrap.break_anywhere=true;
+            ctx.fonts(|fonts|fonts.layout_job(job))
+        };
+        let mut galley=layout(text.to_owned());
+        if let Some((index,_))=current.filter(|_|galley.rows.len()>1) {
+            let lyrics=self.ly.lyrics.as_ref().unwrap();
+            let start=lyrics.lines[index].t;
+            let end=lyrics.lines.iter().skip(index+1).find(|line|line.t>start).map_or(self.media.duration as f32,|line|line.t);
+            let progress=if end>start {((self.lyric_position()-start)/(end-start)).clamp(0.0,1.0)}else{0.0};
+            // 按当前句的时间范围与各段字数切换，暂停和跳转直接跟随播放位置。
+            let total:usize=galley.rows.iter().map(|row|row.glyphs.len()).sum();
+            let mut count=0;
+            let page=galley.rows.iter().position(|row|{count+=row.glyphs.len();progress*(total as f32)<count as f32}).unwrap_or(galley.rows.len()-1);
+            let segment=galley.rows[page].glyphs.iter().map(|glyph|glyph.chr).collect::<String>();
+            galley=layout(segment.trim().to_owned());
+        }
+        self.island_lyric_layout=Some(galley);
+    }
+
+    fn effective_minimal(&self)->bool {self.settings.minimal || self.browser_minimal_active}
+    pub(crate) fn pet_enabled(&self)->bool {self.settings.pet && !self.effective_minimal()}
+    pub(crate) fn pet_space(&self)->f32 {if self.pet_enabled(){44.0}else{0.0}}
+    fn lyric_focus_space(&self)->f32 {if self.pomo.running{crate::focus_bar::LYRIC_WIDTH+10.0}else{0.0}}
+    fn lyric_bar_width(&self)->f32 {LYRIC_BAR_W+if self.pet_enabled(){48.0}else{0.0}+self.lyric_focus_space()}
+    fn notice_size(&self,a:&Alert)->(f32,f32) {
+        let (width,height)=if a.meeting.is_some(){(360.0,136.0)}else if a.title=="蓝牙设备"{(HUD_W,48.0)}else if a.is_hud(){(HUD_W,38.0)}else{(334.0,44.0)};
+        (width,height)
+    }
+    pub fn set_pet(&mut self,enabled:bool) {
+        self.settings.pet=enabled;if enabled {self.settings.minimal=false;}self.settings.save();
+    }
+    /// 把「岛体外观 → 动效」立即应用到岛体（设置页修改后调用）。
+    pub(crate) fn apply_motion_setting(&self) {
+        crate::bar_layout::set_motion_override(self.settings.motion.enabled());
+    }
+
+    pub fn set_minimal(&mut self,enabled:bool) {
+        self.settings.minimal=enabled;if enabled {self.settings.pet=false;}self.settings.save();
+    }
+    fn base_size(&self) -> (f32, f32) {
+        if !self.compact_notices()&&!self.open {
+            if let Some(a)=&self.notice {let (width,height)=self.notice_size(a);return (width+self.pet_space(),height);}
+        }
+        if self.island_lyrics_active() {
+            (self.lyric_bar_width(),BAR_H)
+        } else if self.effective_minimal()&&self.t>=self.notification_bell_until {
+            (BAR_W_MIN, BAR_H_MIN)
+        } else {
+            (self.resident.target.width, BAR_H)
+        }
+    }
+
+    /// 0 = 药丸，1 = 完整面板（展开时可略超过 1）。
+    #[cfg(test)]
+    pub(crate) fn current_width(&self) -> f32 { self.w.pos+self.notice_width.pos }
+
+    pub fn progress(&self) -> f32 {
+        let (_, bh) = self.base_size();
+        (self.h.pos - bh) / (self.expanded_height() - bh)
+    }
+
+    pub(crate) fn expanded_height(&self)->f32 {
+        if self.page==CALENDAR_PAGE {CALENDAR_H}else if self.page==5&&self.mail.open_uid.is_some(){236.0}else{PH}
+    }
+
+    // ---------------------------------------------------------------
+    // 每帧入口
+    // ---------------------------------------------------------------
+    pub fn frame(&mut self, ui: &mut egui::Ui, win: Rect, env: &Env) -> FrameOut {
+        let ctx = ui.ctx().clone();
+        let dt = match self.last_t {
+            Some(t0) => (env.t - t0).clamp(0.0, 0.1) as f32,
+            None => 0.0,
+        };
+        let elapsed = self.last_t.map(|at| (env.t - at).max(0.0) as f32).unwrap_or(0.0);
+        self.last_t = Some(env.t);
+        self.t = env.t;
+        self.quota_tick();
+        self.current_hour=env.hour();
+        self.system_idle=env.idle_seconds;
+        self.dt = dt;
+        if let Some(at_top)=env.browser_at_top {self.browser_at_top=at_top;}
+        let browser_minimal=self.settings.browser_minimal && self.browser_at_top;
+        if browser_minimal && !self.browser_minimal_active {
+            self.open=false;
+            self.hover_lock=true;
+            self.hover_since=None;
+            self.leave_since=None;
+            self.forced_open_until=0.0;
+        }
+        self.browser_minimal_active=browser_minimal;
+        if !self.started {
+            self.started = true;
+            self.last_input = env.t;
+            self.last_reminder = env.t;
+            self.page_t0 = env.t - 10.0;
+            if self.page==CALENDAR_PAGE {self.request_calendar_month(false);}
+        }
+        let mut cmds = Vec::new();
+
+        self.tick(env, dt, elapsed);
+        self.sync_device(env);
+        self.tick_alerts();
+        let hud_active=self.notice.clone();
+        if hud_active.as_ref().map(|a|&a.title)!=self.hud_notice.as_ref().map(|a|&a.title)||hud_active.is_none(){self.notice_details=false;}
+        if let Some(a)=&hud_active {self.hud_notice=Some(a.clone());}
+        let hud_target=if hud_active.is_some(){1.0}else{0.0};
+        self.hud_alpha=hud_alpha_step(self.hud_alpha,hud_target,dt,crate::bar_layout::animations_enabled(),hud_active.is_some());
+        if hud_active.is_none() && self.hud_alpha<0.003 {self.hud_notice=None;}
+        let notice_target=if self.compact_notices()&&(self.notice.is_some()||self.t<self.notification_bell_until) {44.0}else{0.0};
+        self.notice_width.target=notice_target;
+        if self.compact_notices(){
+            if crate::bar_layout::animations_enabled(){self.notice_width.step(dt);}else{self.notice_width.snap(notice_target);}
+        }else{self.notice_width.snap(0.0);self.notice_details=false;}
+        self.update_media(env,&ctx);
+        let bell=self.t<self.notification_bell_until&&!self.compact_notices();
+        self.resident_power=(env.battery,env.charging);
+        let mut layout=Layout::new(self.settings.show_battery&&env.battery.is_some(),self.quota_bar_indices().len(),self.media.is_music()&&!bell,self.pomo.running,bell,self.pet_enabled(),self.settings.mem_widget_enabled&&env.memory.is_some(),self.dsh_resident().is_some());
+        bar::set_clock_wide(self.settings.clock_show_seconds);
+        layout.reorder(&self.settings.resident_order);
+        if self.pet_enabled() {
+            if let Some(a)=self.notice.as_ref().filter(|_|!self.compact_notices()&&!self.open){layout.x[bar::PET]=Some(22.0-(self.notice_size(a).0+self.pet_space())/2.0);}
+            else if self.island_lyrics_active() {layout.x[bar::PET]=Some(60.0-self.lyric_bar_width()/2.0);}
+        }
+        self.resident.step(layout,dt,ctx.style().animation_time>0.0&&bar::animations_enabled());
+        if self.opts.fetch_lyrics {
+            self.poll_lyrics();
+        }
+        self.update_island_lyric_layout(&ctx);
+
+        let cx = win.center().x;
+        let top = win.top();
+
+        // ---------- 输入：拖放 ----------
+        let (hovering_files, dropped) = ctx.input(|i| {
+            (
+                self.settings.visible_pages[3] && !i.raw.hovered_files.is_empty(),
+                i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect::<Vec<_>>(),
+            )
+        });
+        if !dropped.is_empty() && self.settings.visible_pages[3] {
+            self.on_drop(dropped);
+            self.show_page(3);
+        } else if hovering_files && !self.drag_hot {
+            self.drag_hot = true;
+            if self.page != 3 {
+                self.drag_saved = Some(self.page);
+                self.go(3, if self.page < 3 { 1.0 } else { -1.0 });
+            }
+        } else if !hovering_files && self.drag_hot {
+            // 拖到外面松手 / 取消：安静地退回原页
+            self.drag_hot = false;
+            if let Some(p) = self.drag_saved.take() {
+                self.go(p, if p < 3 { -1.0 } else { 1.0 });
+            }
+        }
+        self.drag_a = anim::approach(self.drag_a, if self.drag_hot { 1.0 } else { 0.0 }, 16.0, dt);
+
+        // ---------- 输入：悬停 ----------
+        let p_prev = self.progress();
+        let hit = self.hit_rect(cx, top, p_prev);
+        let inside = env.cursor.is_some_and(|c| hit.contains(c));
+        let on_notice=env.cursor.is_some_and(|c|self.notice_rect(cx,top).is_some_and(|r|r.contains(c))||self.notice_details_rect(cx,top).is_some_and(|r|r.contains(c)));
+        if !inside {
+            self.hover_lock = false;
+        }
+        if env.cursor != self.last_cursor || ctx.input(|i| !i.events.is_empty()) {
+            if inside || hovering_files || ctx.input(|i| !i.events.is_empty()) {
+                self.last_input = env.t;
+            }
+            self.last_cursor = env.cursor;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.is_editing() {
+            self.cancel_edit();
+        }
+        if !self.is_editing() && inside && self.open && self.reveal > 0.95 {
+            let (scroll, left, right, esc) = ctx.input(|i| (i.raw_scroll_delta.y, i.key_pressed(egui::Key::ArrowLeft), i.key_pressed(egui::Key::ArrowRight), i.key_pressed(egui::Key::Escape)));
+            if esc { self.hover_lock = true; }
+            if left || right {
+                self.wheel_delta=0.0;
+                self.navigate_page(right);
+            } else if scroll!=0.0 {
+                let cursor=env.cursor.unwrap()-Vec2::new(cx-PW/2.0,top);
+                let mail_body=self.page==5 && self.mail.open_uid.is_some()
+                    && Rect::from_min_max(Pos2::new(46.0,104.0),Pos2::new(374.0,194.0)).contains(cursor);
+                let mail_list=self.page==5 && self.mail.open_uid.is_none() && self.mail.recent.len()>3 && Rect::from_min_max(Pos2::new(182.0,36.0),Pos2::new(380.0,122.0)).contains(cursor);
+                // 倒计时设定状态下，滚轮落在大号时间上用来调整时长，不翻页。
+                let timer_digits=self.page==9 && self.timer.editable()
+                    && crate::pages::timer_edit_rect().contains(cursor);
+                if mail_body || mail_list || timer_digits {self.wheel_delta=0.0;}
+                else {
+                    // 累积高精度滚轮的小幅输入；停顿或反向时丢弃上一段余量。
+                    if self.t-self.wheel_at>0.18 || self.wheel_delta*scroll<0.0 {self.wheel_delta=0.0;}
+                    self.wheel_at=self.t;
+                    self.wheel_delta+=scroll;
+                    if self.wheel_delta.abs()>=8.0 {
+                        let next=self.wheel_delta<0.0;
+                        self.wheel_delta=0.0;
+                        let calendar_len=if self.page==CALENDAR_PAGE {self.calendar_entries(self.calendar.view.day).len()}else{0};
+                        let calendar_body=self.page==CALENDAR_PAGE && Rect::from_min_max(Pos2::new(163.0,52.0),Pos2::new(378.0,208.0)).contains(cursor);
+                        let list=match self.page {
+                            CALENDAR_PAGE if calendar_body=>Some((&mut self.calendar.view.first,calendar_len.saturating_sub(4))),
+                            4 if Rect::from_min_max(Pos2::new(196.0,31.0),Pos2::new(377.0,124.0)).contains(cursor)
+                                =>Some((&mut self.todo_first,self.todos.items.len().saturating_sub(3))),
+                            3 if Rect::from_min_max(Pos2::new(36.0,28.0),Pos2::new(383.0,128.0)).contains(cursor)
+                                =>Some((&mut self.shelf_first,self.shelf.items.len().saturating_sub(5))),
+                            DSH_PAGE if Rect::from_min_max(Pos2::new(152.0,58.0),Pos2::new(380.0,128.0)).contains(cursor)
+                                =>{let max=self.dsh_selected_len().saturating_sub(4);Some((&mut self.dsh.first,max))},
+                            _=>None,
+                        };
+                        let scrolled=list.is_some_and(|(first,max)|{
+                            let target=if next {(*first+1).min(max)}else{first.saturating_sub(1)};
+                            let changed=target!=*first;*first=target;changed
+                        });
+                        // 内容区优先滚动列表，空列表和边界继续翻页；连续滚动保留短暂间隔。
+                        if !scrolled && !calendar_body && self.t-self.wheel_page_at>=0.20 {
+                            self.navigate_page(next);
+                            self.wheel_page_at=self.t;
+                        }
+                        ctx.input_mut(|i|{i.raw_scroll_delta=Vec2::ZERO;i.smooth_scroll_delta=Vec2::ZERO;});
+                    }
+                }
+            }
+        } else {self.wheel_delta=0.0;}
+        let want = (inside && !self.hover_lock && (self.compact_notices()||self.notice.is_none()||self.open)) || self.open && on_notice || (self.open && self.t<self.forced_open_until) || self.drag_hot || (self.is_editing() && self.open);
+        self.morph(want, inside, env.t, dt);
+        self.update_pet(env, cx);
+
+        // ---------- 绘制 ----------
+        let p = self.progress();
+        let (w, h) = (self.w.pos, self.h.pos);
+        let panel = Rect::from_min_size(Pos2::new(cx - w / 2.0, top), Vec2::new(w, h));
+        let pc = anim::clamp01(p);
+        let painter = ui.painter_at(ui.max_rect().expand(40.0));
+        let feather = 1.0 / ctx.pixels_per_point();
+        let minimal_pill = self.effective_minimal() && !self.island_lyrics_active() && self.notice.is_none() && self.t>=self.notification_bell_until && pc < 0.02;
+        let flare = if minimal_pill { 0.0 } else { lerp(5.0, FLARE, pc) };
+        let k = (w / PW).clamp(0.3, 1.1);
+        let radius_scale = self.settings.island_radius.clamp(60, 160) as f32 / 100.0;
+        let radius = if minimal_pill { BAR_H_MIN / 2.0 } else { lerp(12.5, RAD * k.min(1.0), pc) * radius_scale };
+        let shell_alpha = (255.0 * self.settings.island_opacity.clamp(45, 100) as f32 / 100.0).round() as u8;
+        let shell = Color32::from_black_alpha(shell_alpha);
+        let flare_h = lerp(8.0, FLARE_H, pc);
+        let thick = glass::thickness(PH);
+        let shadow_k = glass::shadow_alpha(0.0, thick) / 0.12;
+        shape::shadow(&painter, panel, flare, flare_h, radius, smoothstep(0.1, 0.9, pc) * shadow_k);
+        let notice_rect=self.notice_rect(cx,top);
+        let notice_shape=notice_rect.map(|r|Rect::from_min_max(Pos2::new(r.left()-36.0,r.top()),r.max));
+        if let Some(r)=notice_shape {shape::shadow(&painter,r,5.0,8.0,12.5,0.5*shadow_k);}
+        shape::fill(&painter, panel, flare, flare_h, radius, shell, feather);
+        if let Some(r)=notice_shape {shape::fill(&painter,r,5.0,8.0,12.5,shell,feather);}
+
+        // 内容只随形体「揭开」：不缩放，按面板裁剪，到 55% 才开始淡入
+        let reveal = if self.open { smoothstep(0.50, 0.97, p) } else { smoothstep(0.55, 0.92, p) };
+        self.reveal = reveal;
+        let origin = Pos2::new(cx - PW / 2.0, top);
+        let clip = panel.intersect(win);
+        let base = Card::new(ui, origin, clip);
+        self.cursor_local = env.cursor.map(|p| base.to_local(p));
+
+        let banner=!self.compact_notices()&&self.notice.is_some()&&!self.open;
+        let restoring_lyrics=!self.open&&self.notice.is_none()&&self.island_lyrics_active()&&self.hud_notice.as_ref().is_some_and(|a|a.meeting.is_some());
+        let fading_hud=!self.compact_notices()&&!self.open&&self.hud_notice.as_ref().is_some_and(|a|a.is_hud())&&(banner||self.hud_alpha>0.003);
+        if fading_hud {
+            let from=self.resident.target.width;let to=HUD_W+self.pet_space();
+            let width_progress=if (to-from).abs()<1.0 {if banner{1.0}else{0.0}}else{((self.w.pos-from)/(to-from)).clamp(0.0,1.0)};
+            let (opacity,header_opacity)=if banner {(self.hud_alpha*smoothstep(0.45,0.85,width_progress),1.0-smoothstep(0.05,0.40,width_progress))}
+                else {(self.hud_alpha*smoothstep(0.20,0.60,width_progress),1.0-smoothstep(0.05,0.25,width_progress))};
+            if !minimal_pill||pc>0.0 {self.shared_header(&base.faded(header_opacity),cx,pc,reveal,env);}
+            if let Some(a)=self.hud_notice.clone(){
+                let overlay=Card::new(ui,panel.min+Vec2::new(self.pet_space(),0.0),panel.intersect(ui.max_rect())).faded(opacity);
+                let overlay=if opacity<0.85||!banner{overlay.ghost()}else{overlay};
+                self.draw_notice(&overlay,panel,&a,&mut cmds);
+            }
+        }else if banner {
+            if let Some(a)=self.notice.clone(){self.draw_notice(&Card::new(ui,panel.min+Vec2::new(self.pet_space(),0.0),panel.intersect(ui.max_rect())),panel,&a,&mut cmds);}
+        }else if !minimal_pill || pc > 0.0 {
+            self.shared_header(&base, cx, if restoring_lyrics{0.0}else{pc}, reveal, env);
+        }
+        if let Some(rect)=notice_rect {
+            let c=Card::new(ui,rect.min,rect.intersect(ui.max_rect()));
+            if let Some(a)=self.hud_notice.clone() {
+                let opacity=self.hud_alpha*smoothstep(0.45,0.95,self.notice_width.pos/44.0);
+                let c=c.faded(opacity);let c=if self.notice.is_none()||opacity<0.85 {c.ghost()}else{c};
+                crate::extras::notice_badge(&c,18.0,15.0,&a);
+                let button=crate::quota_ui::bar_tooltip(c.hit(0.0,0.0,36.0,BAR_H,"notice-badge"),format!("{}\n{}",a.title,a.body));
+                if button.clicked(){self.notice_details=!self.notice_details;}
+            }else if self.t<self.notification_bell_until {
+                paint::bell(&c.scaled(20.0,14.0,1.2),20.0,14.0,theme::WHITE,paint::bell_swing(self.t-self.notification_bell_at));
+                c.circle(24.0,9.5,2.0,Color32::from_rgb(255,72,72));
+                if c.hit(6.0,0.0,28.0,30.0,"bell-mail").clicked(){self.open_notifications_panel();}
+            }
+        }
+        let notice_details=self.notice_details_rect(cx,top);
+        if let Some(rect)=notice_details {
+            let radius=if self.hud_notice.as_ref().is_some_and(|a|a.meeting.is_some()){14.0}else{10.0};
+            shape::shadow(&painter,rect,0.0,0.0,radius,0.5*shadow_k);
+            painter.rect_filled(rect,radius,shell);
+            self.draw_notice(&Card::new(ui,rect.min,rect.intersect(ui.max_rect())),rect,&self.hud_notice.clone().unwrap(),&mut cmds);
+            if ctx.input(|i|i.pointer.any_pressed()&&i.pointer.interact_pos().is_some_and(|p|!rect.contains(p)&&!notice_rect.is_some_and(|r|r.contains(p)))){self.notice_details=false;}
+        }
+        let pet_alpha=self.pet_a*(1.0-smoothstep(0.0,0.3,pc));
+        if pet_alpha>0.004 && !minimal_pill {
+            let y=(h.min(self.base_size().1)-BAR_H).max(0.0)/2.0;
+            self.pet.draw(&base.shifted(0.0,y).faded(pet_alpha),cx-origin.x+self.resident.position(bar::PET),self.t);
+        }
+        if reveal > 0.004 && !banner && !restoring_lyrics {
+            let c = base.shifted(0.0, (1.0 - reveal) * -5.0).faded(reveal);
+            let c = if reveal < 0.6 { c.ghost() } else { c };
+            if self.calendar.draft.is_some(){self.draw_calendar_editor(&c);}else if self.task_dialog.is_some(){self.draw_task_editor(&c);}else{self.panel_body(&c, env, &mut cmds);}
+            if !self.toast_below {self.toast_layer(&c,106.0);}
+        }
+        // 岛下的确认提示使用独立裁剪区域，收起时跟随岛体下沿。
+        let floating_toast=if self.toast_below && self.toast.is_some() {
+            self.toast_layer(&Card::new(ui,origin,win),h+8.0)
+        }else{None};
+        if (self.adding||self.editing.is_some()) && reveal > 0.9 && self.page == 4 && self.page_e() > 0.25 {
+            self.input_field(ui, origin, &mut cmds);
+        }
+
+        if self.task_dialog.is_some() && reveal>0.9 {self.task_editor_inputs(ui,origin,&mut cmds);}
+        if self.calendar.draft.is_some() && reveal>0.9 {self.calendar_editor_inputs(ui,origin,&mut cmds);}
+
+        // ---------- 输出 ----------
+        let rel = |r: Rect| r.translate(-win.min.to_vec2());
+        let mut region = if p > 0.02 || self.open {
+            let height=self.expanded_height().max(self.h.pos)*1.08+16.0;
+            Rect::from_center_size(Pos2::new(cx, top + height/2.0), Vec2::new(PW + FLARE * 2.0 + 56.0, height))
+        } else {
+            let (bw, bh) = self.base_size();
+            Rect::from_center_size(Pos2::new(cx, top + (bh * SWELL.1 + 12.0) / 2.0), Vec2::new(bw * SWELL.0 + 24.0, bh * SWELL.1 + 12.0))
+        };
+        if let Some(rect)=notice_shape {region=region.union(rect.expand2(Vec2::new(12.0,8.0)));}
+        if let Some(rect)=notice_details {region=region.union(rect.expand(12.0));}
+        let transitioning = !self.w.settled(PW)
+            || !self.h.settled(self.expanded_height())
+            || self.page_e() < 0.7
+            || self.dots.iter().any(|d| !d.settled(16.0))
+            || self.hover_since.is_some() && !self.open
+            || self.leave_since.is_some()
+            || (self.drag_a > 0.001 && self.drag_a < 0.999)
+            || self.drag_hot
+            || (self.pet_a > 0.001 && self.pet_a < 0.999)
+            || !self.resident.settled()
+            || self.open && self.page==3 && self.shelf_x.values().any(|s| !s.settled(68.0))
+            || self.open && self.page==2 && !self.water_ring.settled(1.0)
+            || self.toast.is_some()
+            || self.t < self.notification_bell_until && self.t-self.notification_bell_at < 0.95
+            || self.hud_alpha > 0.003 && self.hud_alpha < 0.997
+            || !self.notice_width.settled(1.0);
+        let pet_visible=self.pet_a>0.01 && !self.open && !minimal_pill;
+        let ambient=self.pomo.running && (self.open && self.page==1 || !self.open && !minimal_pill && self.notice.is_none() && bar::animations_enabled())
+            || self.media.playing && (self.open && self.page==0 || !self.open && !minimal_pill && self.notice.is_none() && self.media.is_music())
+            || self.notice.as_ref().is_some_and(|notice|notice.meeting.is_some())
+            // 系统页的曲线与数字持续缓动，打开时保持 30 帧。
+            || self.open && self.page==8 && self.system.has_data()
+            || self.timer.running
+            // 天气页图标有缓慢的太阳转动/云层漂移。
+            || self.open && self.page==10 && self.weather.current.is_some()
+            // 进程页需要跟随后台采样刷新。
+            || self.open && self.page==11;
+        let animating=transitioning || ambient || pet_visible && self.pet.state!=PetState::Sleeping;
+        // 交互形变保持 60 帧，媒体 30 帧；小表情 20 帧，睡眠 10 帧，静态界面每秒核对提醒。
+        // 系统闲置超过 1 分钟时，睡眠中的吉祥物降到 5 帧，进一步降低纯待机功耗。
+        let idle_seconds = env.idle_seconds.unwrap_or(0.0);
+        let repaint_after=std::time::Duration::from_secs_f64(if transitioning{1.0/60.0}else if ambient{1.0/30.0}else if pet_visible{if self.pet.state==PetState::Sleeping{if idle_seconds>=60.0{0.2}else{0.1}}else{0.05}}else if self.settings.clock_show_seconds{0.5}else{1.0});
+        cmds.append(&mut self.pending);
+        FrameOut {
+            region: rel(floating_toast.map_or(region,|toast|region.union(toast)).intersect(ui.max_rect())),
+            hit: rel(self.hit_rect(cx, top, self.progress())),
+            notice_hit:notice_shape.map(|r|rel(notice_details.map_or(r,|details|r.union(details)))),
+            file_drop_zone:self.settings.visible_pages[3].then(||rel(Rect::from_min_size(Pos2::new(cx-PW/2.0,top),Vec2::new(PW,96.0)))),
+            expanded: self.open,
+            editing: self.is_editing(),
+            animating,
+            repaint_after,
+            cmds,
+        }
+    }
+
+    fn hit_rect(&self, cx: f32, top: f32, p: f32) -> Rect {
+        if self.effective_minimal() && !self.open {
+            let (width,height)=self.base_size();
+            let width=self.w.pos.min(width);
+            let height=self.h.pos.min(height);
+            Rect::from_min_size(Pos2::new(cx-width/2.0,top),Vec2::new(width,height))
+        } else if self.notice.is_some()&&!self.compact_notices()&&!self.open {
+            let (w,h)=self.base_size();Rect::from_min_size(Pos2::new(cx-(w+8.0)/2.0,top),Vec2::new(w+8.0,h+6.0))
+        } else if p > 0.04 || self.open {
+            Rect::from_min_size(Pos2::new(cx - PW / 2.0 - 4.0, top), Vec2::new(PW + 8.0, self.expanded_height() + 2.0))
+        } else {
+            let (bw,bh)=self.base_size();
+            let (hit_w,hit_h)=(bw+12.0,bh+4.0);
+            Rect::from_min_size(Pos2::new(cx-hit_w/2.0,top),Vec2::new(hit_w,hit_h))
+        }
+    }
+
+    fn notice_rect(&self,cx:f32,top:f32)->Option<Rect>{
+        if !self.compact_notices(){return None;}
+        let width=self.notice_width.pos-8.0;
+        (width>0.5).then(||Rect::from_min_size(Pos2::new(cx+self.w.pos/2.0+8.0,top),Vec2::new(width,BAR_H)))
+    }
+    fn notice_details_rect(&self,cx:f32,top:f32)->Option<Rect>{
+        let a=self.hud_notice.as_ref().filter(|_|self.notice_details&&self.notice.is_some())?;
+        let badge=self.notice_rect(cx,top)?;let (width,height)=self.notice_size(a);
+        Some(Rect::from_min_size(badge.left_bottom()+Vec2::new(0.0,6.0),Vec2::new(width,height)))
+    }
+
+    /// 悬停状态机：意图缓冲 → 弹簧展开 → 离开延迟 → 临界阻尼收起；全程可打断。
+    fn morph(&mut self, want: bool, inside: bool, t: f64, dt: f32) {
+        let (bw, bh) = self.base_size();
+        if want {
+            self.leave_since = None;
+            let since = *self.hover_since.get_or_insert(t);
+            let intent=if self.effective_minimal() {MINIMAL_HOVER_INTENT}else{HOVER_INTENT};
+            if !self.open && (self.drag_hot || t - since >= intent) {
+                self.open = true;
+                self.w.tune(OPEN_W.0, OPEN_W.1);
+                self.h.tune(OPEN_H.0, OPEN_H.1);
+                self.w.target = PW;
+                self.h.target = self.expanded_height();
+                if self.drag_hot {
+                    // 拖入不等缓冲，直接给一点初速度，30 ms 内就能看到形变
+                    self.w.vel = self.w.vel.max(600.0);
+                    self.h.vel = self.h.vel.max(260.0);
+                }
+            } else if !self.open {
+                self.w.tune(SWELL_K.0, SWELL_K.1);
+                self.h.tune(SWELL_K.0, SWELL_K.1);
+                self.w.target = bw * SWELL.0;
+                self.h.target = bh * SWELL.1;
+            }
+        } else {
+            self.hover_since = None;
+            if self.open {
+                let since = *self.leave_since.get_or_insert(t);
+                if t - since >= LEAVE_DELAY {
+                    self.open = false;
+                    self.leave_since = None;
+                    self.w.tune(CLOSE.0, CLOSE.1);
+                    self.h.tune(CLOSE.0, CLOSE.1);
+                    self.w.target = bw;
+                    self.h.target = bh;
+                    self.cancel_edit();
+                    self.confirm_clear = None;
+                }
+            } else {
+                self.w.tune(CLOSE.0, CLOSE.1);
+                self.h.tune(CLOSE.0, CLOSE.1);
+                self.w.target = bw;
+                self.h.target = bh;
+            }
+        }
+        let _ = inside;
+        if self.open {self.h.target=self.expanded_height();}
+        let motion = crate::bar_layout::animations_enabled();
+        let (prev_w,prev_h)=(self.w.pos,self.h.pos);
+        self.w.step(dt);
+        self.h.step(dt);
+        if !motion {
+            self.w.snap(self.w.target);
+            self.h.snap(self.h.target);
+        }
+        // 仅在从外侧越过目标时收住，扩展提示条时不强制跳到目标宽度。
+        if !self.open {
+            if prev_w>=bw && self.w.pos<bw {self.w.snap(bw);}
+            if prev_h>=bh && self.h.pos<bh {self.h.snap(bh);}
+        }
+        for d in &mut self.dots {
+            d.step(dt);
+            if !motion { d.snap(d.target); }
+        }
+        self.slide.step(dt);
+        if !motion { self.slide.snap(0.0); }
+    }
+
+    // ---------------------------------------------------------------
+    // 顶栏：电池 + 日期 + 时钟。药丸里的电池与时钟会「飞」到顶栏位置（共享元素过渡）。
+    // ---------------------------------------------------------------
+    fn shared_header(&mut self, base: &Card, cx: f32, p: f32, reveal: f32, env: &Env) {
+        let local_cx = cx - base.origin.x;
+        let lyric=self.island_lyric();
+        let lyric_alpha=if self.island_lyrics_active() {1.0-smoothstep(0.0,0.35,p)}else{0.0};
+        if let Some(galley)=self.island_lyric_layout.clone().filter(|_|lyric_alpha>0.003) {
+            let c=base.faded(lyric_alpha);
+            let content_width=self.lyric_bar_width()-self.lyric_focus_space();
+            let width=self.w.pos.max(content_width);
+            let left=local_cx-width/2.0;
+            let center_y=BAR_H/2.0;
+            if let Some((image,texture))=&self.music_artwork {
+                let [width,height]=image.size;
+                let uv_size=if width>height {egui::vec2(height as f32/width as f32,1.0)}else{egui::vec2(1.0,width as f32/height as f32)};
+                let uv=Rect::from_center_size(Pos2::new(0.5,0.5),uv_size);
+                c.painter.add(egui::epaint::RectShape::filled(c.rect(left+12.0,center_y-10.0,20.0,20.0),5.0*c.s,Color32::WHITE).with_texture(texture.id(),uv));
+            } else {
+                c.fill(left+12.0,center_y-10.0,20.0,20.0,5.0,theme::CARD);
+                paint::note(&c,left+22.0,center_y,13.0,theme::WHITE);
+            }
+            let index=lyric.map_or(0,|(index,_)|index);
+            let shown=c.ui.ctx().animate_value_with_time(egui::Id::new(("island-lyric-line",&self.ly.key)),index as f32,0.18);
+            let fade=1.0-(index as f32-shown).abs().min(1.0);
+            let position=c.pos(left+content_width-LYRIC_BAR_W/2.0,center_y-galley.size().y/2.0+(1.0-fade)*3.0);
+            c.painter.galley(position,galley,if lyric.is_some(){theme::WHITE}else{theme::GRAY});
+            self.draw_playback_bars(&c,left+content_width-21.0,center_y);
+            if self.pomo.running {
+                let alpha=smoothstep(0.88,1.0,(width-content_width)/self.lyric_focus_space());
+                crate::focus_bar::draw(&c.faded(alpha),left+width-14.0-crate::focus_bar::LYRIC_WIDTH/2.0,center_y,self.t,&self.pomo,self.phase_secs(self.pomo.phase),true);
+            }
+        }
+        if lyric_alpha>=0.997 {return;}
+        let header=base.faded(1.0-lyric_alpha);
+        let base=&header;
+        let m = anim::ease_in_out(smoothstep(0.0, 0.85, p));
+        // 倒计时运行时，收起态直接把药丸时钟换成剩余时间，抬眼就能看见。
+        let timer_clock = self.timer.running && self.timer.mode == TimerMode::Countdown && !self.open;
+        let clock_chars = if self.settings.clock_show_seconds { 8 } else { 5 };
+        let clock = if timer_clock {
+            self.timer.display()
+        } else {
+            env.clock.get(..clock_chars).unwrap_or("--:--").to_string()
+        };
+        let show_battery=self.settings.show_battery && env.battery.is_some();
+
+        // 顶栏终点布局：[电池][日期][时钟] 作为一组整体居中
+        let date_w = base.text_w(&env.date, size::DATE, W::Regular);
+        let clock_w = base.text_w(&clock, size::CLOCK, W::Bold);
+        let battery_space=if show_battery {24.0}else{0.0};
+        let group = battery_space + date_w + 8.0 + clock_w;
+        let gx = local_cx - group / 2.0 + if show_battery {6.0}else{0.0};
+        let hb = (gx + 8.5, 18.6);
+        let hd = gx + battery_space;
+        let hc = hd + date_w + 8.0;
+        // 药丸起点布局
+        let has_music=self.media.is_music();
+        let layout=self.resident.current();
+        let pb=(local_cx+layout.x[bar::BATTERY].unwrap_or(0.0),15.0);
+        let pcx=local_cx+layout.x[bar::CLOCK].unwrap()-base.text_w(&clock,size::PILL_CLOCK,W::Bold)/2.0;
+
+        if self.effective_minimal() && self.t>=self.notification_bell_until && p < 0.02 { return; }
+        // 电池：位置/大小连续插值
+        let bk = lerp(1.0, 0.8, m);
+        let bpos = (lerp(pb.0, hb.0, m), lerp(pb.1, hb.1, m));
+        if show_battery {paint::battery(&base.faded(lerp(layout.clearance(bar::BATTERY),1.0,m)), bpos.0, bpos.1, env.battery, env.charging, bk);}
+
+        // 时钟：两个字号沿同一路径交叉淡化，避免逐帧换字号
+        let cpos = (lerp(pcx, hc, m), lerp(21.0, 23.0, m));
+        let a_pill = (1.0 - smoothstep(0.25, 0.6, m)) * layout.clearance(bar::CLOCK);
+        let a_head = smoothstep(0.35, 0.75, m);
+        if a_pill > 0.0 {
+            base.faded(a_pill).text(cpos.0, cpos.1, &clock, size::PILL_CLOCK, W::Bold, if timer_clock { theme::CYAN } else { theme::WHITE }, H::Left);
+        }
+        if a_head > 0.0 {
+            base.faded(a_head).text(cpos.0, cpos.1 - 0.5, &clock, size::CLOCK, W::Bold, theme::WHITE, H::Left);
+        }
+        // 日期随内容淡入，从药丸方向轻轻滑出
+        if reveal > 0.0 {
+            base.faded(reveal).text(hd + (1.0 - reveal) * 10.0, 22.5, &env.date, size::DATE, W::Regular, Color32::from_rgb(210, 210, 214), H::Left);
+        }
+        if has_music && (p>0.1 || layout.x[bar::MUSIC].is_some()) {
+            self.draw_playback_bars(base,lerp(local_cx+layout.x[bar::MUSIC].unwrap_or(0.0),367.0,m),lerp(15.0,18.0,m));
+        }
+        let compact_alpha=1.0-smoothstep(0.0,0.22,p);
+        if self.t<self.notification_bell_until&&!self.compact_notices()&&p<0.1 {
+            if let Some(x)=layout.x[bar::BELL]{
+                let x=local_cx+x;paint::bell(&base.scaled(x,14.0,1.2),x,14.0,theme::WHITE,paint::bell_swing(self.t-self.notification_bell_at));
+                base.circle(x+4.0,9.5,2.0,Color32::from_rgb(255,72,72));
+                if base.hit(x-14.0,3.0,28.0,25.0,"bell-mail").clicked(){self.open_notifications_panel();}
+            }
+        }
+        if compact_alpha>0.004 {
+            let c=base.faded(compact_alpha);let c=if compact_alpha<0.8{c.ghost()}else{c};
+            self.draw_quota_bar(&c,local_cx,&layout);
+        }
+        if self.pomo.running && compact_alpha>0.004 {
+            crate::focus_bar::draw(&base.faded(compact_alpha),local_cx+layout.x[bar::FOCUS].unwrap(),15.0,self.t,&self.pomo,self.phase_secs(self.pomo.phase),false);
+        }
+        if compact_alpha>0.004 {
+            let alpha=layout.pet_clearance(bar::MEMORY);
+            let c=base.faded(compact_alpha*alpha);let c=if compact_alpha*alpha<0.8{c.ghost()}else{c};
+            self.draw_memory_bar(&c,local_cx,&layout);
+        }
+        if compact_alpha>0.004 {
+            let alpha=layout.pet_clearance(bar::TASK);
+            let c=base.faded(compact_alpha*alpha);let c=if compact_alpha*alpha<0.8{c.ghost()}else{c};
+            crate::dsh_tasks_ui::draw_task_bar(self,&c,local_cx,&layout);
+        }
+    }
+
+    fn update_pet(&mut self, env: &Env, cx: f32) {
+        let cx=cx+self.resident.position(bar::PET);
+        let idle = self.idle_for();
+        if self.pet.last_idle >= self.opts.pet_idle && idle < 1.0
+            && matches!(self.pet.state, PetState::Dozing | PetState::Sleeping) {
+            self.pet.waking_until = self.t + 2.2;
+        }
+        self.pet.last_idle = idle;
+        self.pet.hovered = env.cursor.is_some_and(|p| (p.x-cx).abs() <= BAR_W/2.0+24.0 && (0.0..70.0).contains(&p.y));
+        self.pet.worried = self.settings.show_battery && env.battery.is_some_and(|v|v<=20) && !env.charging || env.network == Some(false);
+        let allowed = self.pet_enabled();
+        if !allowed { self.pet.reaction = None; self.pet.waking_until = 0.0; }
+        let available = allowed && !self.open && !self.drag_hot;
+        let shown = available;
+        self.pet_a = anim::approach(self.pet_a, if shown {1.0}else{0.0}, 9.0, self.dt);
+        let visible = available && self.pet_a > 0.7 && self.progress() < 0.1;
+        self.pet.advance(self.dt, visible);
+        let state = self.pet_state();
+        let gaze = env.cursor.map(|p| [((p.x-cx)/28.0).clamp(-3.0,3.0), ((p.y-15.0)/40.0).clamp(-1.0,1.5)])
+            .unwrap_or([(self.t as f32 * 0.35).sin()*0.8, 0.0]);
+        self.pet.step(state, self.t, self.dt, gaze, visible);
+    }
+
+    // ---------------------------------------------------------------
+    // 面板主体：页标题 + 页面（带切页过渡）+ 翻页箭头 + 页码豆
+    // ---------------------------------------------------------------
+    fn panel_body(&mut self, c: &Card, env: &Env, cmds: &mut Vec<Cmd>) {
+        let settings=c.hit(380.0,4.0,28.0,28.0,"page-settings").on_hover_text(format!("打开{}设置窗口",PAGE_NAMES[self.page]));
+        let (hover,press)=c.hover_t(&settings);
+        c.circle(394.0,18.0,13.0,Color32::from_white_alpha((hover*24.0) as u8));
+        paint::gear(&c.scaled(394.0,18.0,0.8*(1.0-press*0.08)),394.0,18.0,paint::mix(theme::GRAY,theme::WHITE,hover));
+        if settings.clicked(){self.settings_tab=PAGE_SETTINGS_TABS[self.page];self.open_settings();}
+        if self.subpage==Some(self.page) {
+            c.text(15.0,25.0,"‹",19.0,W::Bold,theme::WHITE,H::Left);
+            c.text(37.0,25.0,if self.page==2{"饮水设置"}else{"专注设置"},size::TITLE,W::Bold,theme::WHITE,H::Left);
+            if c.hit(9.0,7.0,28.0,23.0,"subpage-back").clicked(){self.subpage=None;}
+            self.page_settings(c);self.nav(c);return;
+        }
+        let e = self.page_e();
+        let in_tx = e < 0.55 && self.page_from != self.page;
+        if in_tx {
+            // 旧页：原地向反方向轻移并快速淡出；新页：弹簧滑入 + 稍晚淡入
+            let old_a = 1.0 - smoothstep(0.0, 0.16, e);
+            let new_a = smoothstep(0.03, 0.28, e);
+            let old_dx = -self.page_dir * 18.0 * anim::ease_out_cubic(e / 0.3);
+            if old_a > 0.0 {
+                let oc = c.faded(old_a).ghost();
+                self.page_title(self.page_from, &oc);
+                self.render_page(self.page_from, &oc.shifted(old_dx, 0.0), env, &mut Vec::new());
+            }
+            let nc = c.faded(new_a);
+            self.page_title(self.page, &nc);
+            let nc = nc.shifted(self.slide.pos, 0.0);
+            let nc = if e < 0.12 { nc.ghost() } else { nc };
+            self.render_page(self.page, &nc, env, cmds);
+        } else {
+            self.page_title(self.page, c);
+            self.render_page(self.page, c, env, cmds);
+        }
+        self.nav(c);
+    }
+
+    fn page_title(&self, page: usize, c: &Card) {
+        let base = 25.0;
+        let (a, b, col) = match page {
+            0 | CALENDAR_PAGE => return,
+            1 => ("番茄", "专注", theme::RED_TOP),
+            2 => ("饮水", "提醒", theme::BLUE),
+            3 => ("置物架", "", theme::WHITE),
+            4 => ("待办", "清单", theme::GREEN),
+            5 => ("邮箱", "", theme::CYAN),
+            6 => ("AI", "额度", theme::SOFT_GREEN),
+            8 => ("系统", "状态", theme::CYAN),
+            9 => ("计时", "工具", theme::GREEN),
+            10 => ("天气", "预报", theme::CYAN),
+            11 => ("进程", "排行", theme::GREEN),
+            DSH_PAGE => ("Agent", "任务", theme::SOFT_GREEN),
+            _ => ("窗屿", "设置", theme::WHITE),
+        };
+        let wa = c.text(15.0, base, a, size::TITLE, W::Bold, theme::WHITE, H::Left);
+        if !b.is_empty() {
+            c.text(15.0 + wa + 1.5, base, b, size::TITLE, W::Bold, col, H::Left);
+        }
+    }
+
+    fn nav(&mut self, c: &Card) {
+        let pages: Vec<_>=self.settings.page_order.iter().copied().filter(|page|self.settings.visible_pages[*page]).collect();
+        if pages.len()<2 { return; }
+        let l = c.hit(8.0, 55.0, 26.0, 26.0, "nav-l");
+        let r = c.hit(385.0, 55.0, 26.0, 26.0, "nav-r");
+        let (lh, lp) = c.hover_t(&l);
+        let (rh, rp) = c.hover_t(&r);
+        paint::chevron(c, 21.0, 68.0, -1.0, lh, lp);
+        paint::chevron(c, 398.0, 68.0, 1.0, rh, rp);
+        if l.clicked() { self.navigate_page(false); }
+        if r.clicked() { self.navigate_page(true); }
+        // 页码豆：宽度由弹簧驱动，整行实时居中；当前页是白色长条
+        let gap = 4.0;
+        let dot_y=self.expanded_height()-7.2;
+        let total: f32 = pages.iter().map(|page| self.dots[*page].pos).sum::<f32>() + gap * (pages.len()-1) as f32;
+        let mut x = PW / 2.0 - total / 2.0;
+        let mut clicked = None;
+        for i in pages {
+            let w = self.dots[i].pos.max(3.0);
+            let on = anim::remap(w, 4.0, 16.0);
+            let col = paint::mix(Color32::from_rgb(92, 92, 96), theme::WHITE, on);
+            c.fill(x, dot_y - 2.0, w, 4.0, 2.0, col);
+            let hr = c.hit(x - 2.0, dot_y - 6.0, w + 4.0, 12.0, ("dot", i));
+            hr.clone().on_hover_text(PAGE_NAMES[i]);
+            let hover=c.ui.ctx().animate_bool_with_time(egui::Id::new(("page-dot-hover",i)),hr.hovered()&&i!=self.page,0.10);
+            if hover>0.01 {
+                c.fill(x - 1.0, dot_y - 3.0, w + 2.0, 6.0, 3.0, Color32::from_white_alpha((hover*28.0) as u8));
+                if hover<0.99 {c.ui.ctx().request_repaint();}
+            }
+            if hr.clicked() {
+                clicked = Some(i);
+            }
+            x += w + gap;
+        }
+        if let Some(i) = clicked {
+            let position=|page|self.settings.page_order.iter().position(|p|*p==page).unwrap();
+            let dir = if position(i) > position(self.page) { 1.0 } else { -1.0 };
+            self.go(i, dir);
+        }
+    }
+
+    fn render_page(&mut self, page: usize, c: &Card, env: &Env, cmds: &mut Vec<Cmd>) {
+        match page {
+            0 => self.page_music(c, env, cmds),
+            1 => self.page_focus(c, env),
+            2 => self.page_water(c, env),
+            3 => self.page_shelf(c, env, cmds),
+            4 => self.page_todo(c, env, cmds),
+            5 => self.page_mail(c, env, cmds),
+            6 => self.page_quota(c),
+            8 => self.page_system(c, env),
+            9 => self.page_timer(c),
+            10 => self.page_weather(c),
+            11 => self.page_processes(c),
+            CALENDAR_PAGE => self.page_calendar(c,env),
+            DSH_PAGE => crate::dsh_tasks_ui::page_dsh(self, c),
+            _ => self.page_settings(c),
+        }
+    }
+
+    fn toast_layer(&mut self, c: &Card, base_y:f32)->Option<Rect> {
+        let Some((msg, at)) = self.toast.clone() else { return None };
+        let e = (self.t - at) as f32;
+        if e > 2.4 {
+            self.toast = None;
+            return None;
+        }
+        let a = smoothstep(0.0, 0.16, e) * (1.0 - smoothstep(2.1, 2.4, e));
+        let rise = (1.0 - anim::ease_out_cubic(e / 0.3)) * 6.0;
+        let msg=c.fit(&msg,size::BODY,W::Regular,310.0);
+        let w = c.text_w(&msg, size::BODY, W::Regular) + 26.0;
+        let tc = c.faded(a);
+        let y = base_y + rise;
+        tc.fill(PW / 2.0 - w / 2.0, y, w, 22.0, 11.0, Color32::from_rgb(44, 44, 48));
+        tc.text(PW / 2.0, y + 15.0, &msg, size::BODY, W::Regular, theme::WHITE, H::Center);
+        Some(tc.rect(PW/2.0-w/2.0,y,w,22.0))
+    }
+
+    // ---------------------------------------------------------------
+    // 每帧推进：番茄钟、饮水提醒、跨天
+    // ---------------------------------------------------------------
+    fn tick(&mut self, env: &Env, dt: f32, elapsed: f32) {
+        self.system.update(env, dt);
+        if self.t - self.spectrum_at > 0.09 {
+            for band in &mut self.spectrum.bands {
+                *band = anim::approach(*band, 0.0, 9.0, dt);
+            }
+            self.spectrum.level = anim::approach(self.spectrum.level, 0.0, 9.0, dt);
+        }
+        if self.timer.tick(elapsed as f64) {
+            let label = match self.timer.mode {
+                TimerMode::Countdown => "倒计时结束",
+                TimerMode::Stopwatch => "计时结束",
+            };
+            self.alert(label, "时间到了，起来活动一下", 9, true);
+        }
+        if self.toast.as_ref().is_some_and(|(_,at)|self.t-at>2.4){self.toast=None;}
+        if env.today != self.today {
+            self.today = env.today.clone();
+            self.water = model::Water::load(&env.today);
+            self.last_drink=None;self.last_reminder=self.t;
+            self.water_ml = self.water.drunk_ml as f32;
+            self.water_ring.snap(self.water.percent() / 100.0);
+        }
+        if self.pomo.running {
+            self.pomo.remaining -= elapsed;
+            if self.pomo.remaining <= 0.0 {
+                let next = match self.pomo.phase {
+                    Phase::Focus => {
+                        self.pet.react(PetState::Happy);
+                        Phase::Rest
+                    }
+                    Phase::Rest => Phase::Focus,
+                };
+                self.pomo.phase = next;
+                self.pomo.remaining = self.phase_secs(next);
+                self.pomo.running = false;
+                self.alert("专注计时", format!("该{}了", next.label()), 1, true);
+            }
+        }
+        self.ring_shown.target = (self.pomo.remaining / self.phase_secs(self.pomo.phase)).clamp(0.0, 1.0);
+        self.ring_shown.step(dt);
+        self.reset_spin.step(dt);
+        self.todo_pop.step(dt);
+
+        if self.water.remind && self.water.percent() < 100.0 && self.water_hours(env.hour() as u32) && self.t - self.last_reminder >= self.settings.water_minutes as f64 * 60.0 {
+            self.last_reminder = self.t;
+            self.alert("喝水时间到了", format!("休息一下，喝 {} ml 水吧", self.settings.serving_ml), 2, true);
+        }
+        let now = format!("{} {}", env.today, env.clock.get(..5).unwrap_or("00:00"));
+        let due: Vec<_> = self.todos.items.iter().enumerate().filter(|(_, item)| item.done_on.is_none() && !item.reminded && item.due.as_ref().is_some_and(|d| d <= &now)).map(|(i,item)| (i,item.text.clone())).collect();
+        for (i,text) in due { self.todos.items[i].reminded = true; self.todos.save(); self.alert("待办到时间了", text, 4, true); }
+        // v0.5.5 会议提醒：.ics 里的开始时间，默认提前 15 分钟（可设 5/15/30）。
+        // v0.5.6 起日历（CalDAV）事件走同一套：同一场会（UID + DTSTART）只提醒一次，
+        // 邮件和日历两条来源撞上了也只弹一次。
+        let lead = self.settings.mail_ics as i64 * 60;
+        let now_ts = chrono::Local::now().timestamp();
+        let mut picks = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for entry in &self.calendar.local {
+            let Some(at)=entry.reminder_at() else{continue;};
+            let key=calendar::dedupe_key(&entry.event);
+            let cutoff=if entry.event.all_day{at+60}else{entry.event.start+60};
+            if now_ts>=at && now_ts<cutoff && !self.mail.fired.contains(&key) && seen.insert(key.clone()) {
+                picks.push((key,entry.event.clone(),"本机日程".into(),CALENDAR_PAGE));
+            }
+        }
+        for (m,provider) in self.calendar_work_events(None) {
+            let left = m.start - now_ts;
+            let key = calendar::dedupe_key(m);
+            if !m.all_day && left <= lead && left > -60 && !self.mail.fired.contains(&key) && seen.insert(key.clone()) {
+                let source=provider.map(|provider|provider.label()).unwrap_or("日历");
+                picks.push((key, m.clone(), source.to_string(), CALENDAR_PAGE));
+            }
+        }
+        if self.settings.mail_enabled {
+            for m in self.mail.recent.iter().filter_map(|m| m.meeting.as_ref()).filter(|m|!self.mail_event_ignored(m)) {
+                let left = m.start - now_ts;
+                let key = calendar::dedupe_key(m);
+                if !m.all_day && left <= lead && left > -60 && !self.mail.fired.contains(&key) && seen.insert(key.clone()) {
+                    picks.push((key, m.clone(), "邮件邀请".to_string(), CALENDAR_PAGE));
+                }
+            }
+        }
+        for (key, meeting, source, page) in picks {
+            self.mail.fired.insert(key);
+            self.meeting_alert(meeting, source, page);
+        }
+        self.water_ring.target = self.water.percent() / 100.0;
+        self.water_ring.step(dt);
+        self.water_ml = anim::approach(self.water_ml, self.water.drunk_ml as f32, 9.0, dt);
+        self.water_view_t.target = self.water_view as f32;
+        self.water_view_t.step(dt);
+        self.remind_t.target = if self.water.remind { 1.0 } else { 0.0 };
+        self.remind_t.step(dt);
+        self.shelf_scroll.target = self.shelf_first as f32;
+        self.shelf_scroll.step(dt);
+        if let Some(at) = self.confirm_clear {
+            if self.t - at > 3.0 {
+                self.confirm_clear = None;
+            }
+        }
+    }
+
+    /// 媒体进度在两次 SMTC 刷新之间按时间外推，进度条才会连续走动。
+    fn update_media(&mut self, env: &Env, ctx: &egui::Context) {
+        let m = &env.media;
+        if !m.is_music() {
+            self.media=NowPlaying::default();
+            self.media_anchor=(String::new(),0.0,0.0,false);
+            self.music_artwork=None;
+            self.ly=LyricsState::default();
+            return;
+        }
+        let a = &self.media_anchor;
+        if a.0 != m.title || (a.1 - m.position).abs() > 0.01 || a.3 != m.playing {
+            self.media_anchor = (m.title.clone(), m.position, env.t, m.playing);
+        }
+        let mut np = m.clone();
+        if m.playing {
+            let (_, pos, at, _) = &self.media_anchor;
+            np.position = if let Some(sampled)=m.sampled_at {m.position+sampled.elapsed().as_secs_f64()}
+                else {pos + (env.t - at).min(3.0)};
+            if m.duration>0.0 {np.position=np.position.min(m.duration);}
+        }
+        if self.media.source != np.source || self.media.song_id != np.song_id { self.ly=LyricsState::default(); }
+        self.media = np;
+        if let Some(image)=&self.media.artwork {
+            if !self.music_artwork.as_ref().is_some_and(|(old,_)|std::sync::Arc::ptr_eq(old,image)) {
+                self.music_artwork=Some((image.clone(),ctx.load_texture("music-artwork",image.clone(),egui::TextureOptions::LINEAR)));
+            }
+        } else {self.music_artwork=None;}
+    }
+
+    fn poll_lyrics(&mut self) {
+        if !self.media.is_music(){self.ly=LyricsState::default();return;}
+        if !self.show_lyrics && !self.settings.island_lyrics {self.ly=LyricsState::default();return;}
+        let np = &self.media;
+        if np.title.is_empty(){self.ly=LyricsState::default();return;}
+        let key = format!("{}|{}|{:.0}", np.title, np.artist, np.duration);
+        if key != self.ly.key || self.ly.retry_at.is_some_and(|at|self.t>=at) {
+            let native_only=key==self.ly.key && np.source.to_ascii_lowercase().contains("kugou")
+                && self.ly.error==Some(lyrics::FetchError::NotFound);
+            let cached=if key==self.ly.key && np.source.to_ascii_lowercase().contains("kugou"){self.ly.lyrics.take()}else{None};
+            self.ly = LyricsState { key, loading: cached.is_none() && !native_only, lyrics:cached.clone(),
+                error:native_only.then_some(lyrics::FetchError::NotFound), ..Default::default() };
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.ly.rx = Some(rx);
+            let (source, title, artist, dur) = (np.source.clone(), np.title.clone(), np.artist.clone(), np.duration);
+            let song_id=np.song_id;
+            if source.to_ascii_lowercase().contains("kugou") || lyrics::is_soda(&source) {
+                let (tx,rx)=std::sync::mpsc::channel();self.ly.native_rx=Some(rx);
+                let (source,title,artist)=(source.clone(),title.clone(),artist.clone());
+                std::thread::spawn(move ||loop {
+                    let found=lyrics::read_native(&source,&title,&artist,dur);
+                    let done=found.is_some();
+                    if tx.send(found).is_err() || done {break;}
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                });
+            }
+            std::thread::spawn(move || {
+                let result=if native_only {
+                    lyrics::kugou_cache::read(&title,&artist,dur).map(|lyrics|(lyrics,false)).ok_or(lyrics::FetchError::NotFound)
+                }else{lyrics::fetch_for_display(&source, &title, &artist, dur, song_id, cached)};
+                let _ = tx.send(result);
+            });
+        }
+        if let Some(rx)=&self.ly.native_rx {
+            let mut found=None;
+            while let Ok(result)=rx.try_recv(){if result.is_some(){found=result;}}
+            if let Some(lyrics)=found {
+                self.ly.lyrics=Some(lyrics);self.ly.loading=false;self.ly.error=None;
+                self.ly.retry_at=None;self.ly.rx=None;self.ly.native_rx=None;
+            }
+        }
+        if let Some(rx) = &self.ly.rx {
+            if let Ok(r) = rx.try_recv() {
+                self.ly.loading = false;
+                match r {
+                    Ok((l,waiting_native)) => {
+                        self.ly.error=None;
+                        self.ly.retry_at=None;
+                        if waiting_native || lyrics::is_soda(&self.media.source) && !l.synced {self.ly.retry_at=Some(self.t+5.0);}
+                        self.ly.lyrics = Some(l);
+                    },
+                    Err(error) => {
+                        if lyrics::is_soda(&self.media.source) || self.media.source.to_ascii_lowercase().contains("kugou") && error==lyrics::FetchError::NotFound {self.ly.retry_at=Some(self.t+5.0);}
+                        else if matches!(error,lyrics::FetchError::Unavailable(_)|lyrics::FetchError::InvalidResponse(_)){self.ly.retry_at=Some(self.t+30.0);}
+                        self.ly.error = Some(error);
+                    },
+                }
+                self.ly.rx = None;
+            }
+        }
+    }
+
+    /// 外部直接提供歌词（录制演示用）。
+    pub fn set_lyrics(&mut self, title: &str, artist: &str, duration: f64, l: lyrics::Lyrics) {
+        self.ly = LyricsState { key: format!("{title}|{artist}|{duration:.0}"), lyrics: Some(l), ..Default::default() };
+    }
+
+    pub fn on_drop(&mut self, files: Vec<PathBuf>) {
+        if !self.settings.visible_pages[3] || files.is_empty() { return; }
+        self.drag_hot = false;
+        self.drag_saved = None;
+        if self.page != 3 {
+            self.go(3, 1.0);
+        }
+        let (mut added,mut duplicate,mut failed) = (0,0,0);
+        for p in files {
+            if !p.exists() {failed+=1;continue;}
+            if self.shelf.items.contains(&p) {
+                duplicate+=1;
+                continue;
+            }
+            if self.shelf.add(&p).is_ok() {
+                self.shelf_born.insert(p.clone(), self.t);
+                added += 1;
+            }else{failed+=1;}
+        }
+        let message=if added==0 && failed==0 {
+            if duplicate==1{"该文件已在置物架中".into()}else{"这些文件已在置物架中".into()}
+        }else if added==0 && duplicate==0 {"文件不存在或无法访问".into()}
+        else {
+            let mut parts=Vec::new();
+            if added>0{parts.push(format!("已添加 {added} 个文件"));}
+            if duplicate>0{parts.push(format!("{duplicate} 个已存在"));}
+            if failed>0{parts.push(format!("{failed} 个无法添加"));}
+            parts.join("，")
+        };
+        self.say(message);
+        if added>0 {
+            self.pet.react(PetState::Happy);
+            self.shelf_first = self.shelf.items.len().saturating_sub(5);
+        }
+    }
+
+    /// 待办输入框：真正的 egui 文本框，放在待办卡片顶部那一行。
+    fn input_field(&mut self, ui: &mut egui::Ui, origin: Pos2, cmds: &mut Vec<Cmd>) {
+        let rect = Rect::from_min_size(origin + Vec2::new(222.0, 37.0), Vec2::new(142.0, 18.0));
+        let mut buf = std::mem::take(&mut self.buf);
+        let te = egui::TextEdit::singleline(&mut buf)
+            .id(egui::Id::new("todo-input"))
+            .frame(false)
+            .margin(egui::Margin::ZERO)
+            .text_color(theme::WHITE)
+            .font(theme::font(size::BODY, W::Regular))
+            .hint_text(egui::RichText::new("要做点什么？回车保存").color(theme::DIM).font(theme::font(size::BODY, W::Regular)))
+            .desired_width(rect.width());
+        let resp = ui.put(rect, te);
+        let first_focus=!self.todo_input_focused;
+        self.buf=buf;
+        let lost_window=ui.input(|i|i.events.iter().any(|event|matches!(event,egui::Event::WindowFocused(false))));
+        if !first_focus && self.adding && self.buf.trim().is_empty() && (resp.clicked_elsewhere() || lost_window) {
+            resp.surrender_focus();
+            self.cancel_edit();
+            return;
+        }
+        if first_focus {
+            self.todo_input_focused=true;
+            resp.request_focus();
+            cmds.push(Cmd::Focus);
+        }
+        let submit = ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if submit {
+            let text = self.buf.trim().to_string();
+            let mut added=false;
+            if let Some(i) = self.editing {
+                if !text.is_empty() && i < self.todos.items.len() {
+                    self.todos.items[i].text = text;
+                    self.todos.save();
+                }
+            } else if !text.is_empty() {
+                self.todo_first = 0;
+                self.todos.items.insert(0, model::TodoItem { text, done_on: None, due: None, reminded: false });
+                self.todos.save();
+                self.todo_pop.vel += 6.0;
+                added=true;
+            }
+            self.cancel_edit();
+            if added {self.open_task_reminder(0);}
+        }
+    }
+}

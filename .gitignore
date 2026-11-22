@@ -1,0 +1,6 @@
+# 第三方参考项目与本地产物，不并入仓库
+WinMemoryCleaner-main/
+*.zip
+.idea/
+.git-legacy/
+.zcode/

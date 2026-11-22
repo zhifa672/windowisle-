@@ -1,0 +1,25 @@
+{
+  "version": 7,
+  "record": {
+    "identity": {
+      "formatVersion": 4,
+      "createdAt": 1793714565749,
+      "cwd": "D:\\Project\\example",
+      "isSeeded": false,
+      "inheritedEventCount": 0
+    },
+    "rows": {
+      "title": { "ver": 3, "seq": 700, "val": "邮箱修复" },
+      "todos": {
+        "ver": 5,
+        "seq": 700,
+        "val": [
+          { "content": "定位收信线程问题", "status": "completed" },
+          { "content": "实现退避重试", "status": "completed" },
+          { "content": "补充单元测试", "status": "completed" }
+        ]
+      },
+      "tokenUsage": { "ver": 2, "seq": 700, "val": { "totals": {} } }
+    }
+  }
+}

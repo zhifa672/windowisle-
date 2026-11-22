@@ -1,0 +1,1782 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+//! Windows 外壳：无边框透明窗口 + 托盘 + 系统数据，界面全部交给 `windowisle::app::App`。
+
+use eframe::egui::{self, Color32, Pos2};
+use windowisle::app::{self, App, Cmd, Env, Options};
+use windowisle::smtc;
+use windowisle::poll_clock::PollClock;
+use std::time::{Duration, Instant};
+
+mod diagnostics;
+
+struct Shell {
+    app: App,
+    t0: Instant,
+    #[cfg(windows)]
+    frame_at: Instant,
+    media: smtc::Shared,
+    placed: bool,
+    win_x: f32,
+    sys: (Option<u8>, bool, PollClock),
+    #[cfg(windows)]
+    system_state: windowisle::system::Snapshot,
+    #[cfg(windows)]
+    system_rx: std::sync::mpsc::Receiver<windowisle::system::Observation>,
+    fullscreen: bool,
+    input_state:windowisle::input::Monitor,
+    #[cfg(windows)]
+    input_keys:Option<windowisle::input::Shortcuts>,
+    #[cfg(windows)]
+    incoming: Option<std::sync::mpsc::Receiver<windowisle::system::Incoming>>,
+    #[cfg(windows)]
+    hidden: bool,
+    #[cfg(windows)]
+    native: Option<windowisle::native::Window>,
+    #[cfg(windows)]
+    tray: Option<windowisle::tray::Tray>,
+    #[cfg(windows)]
+    autostart: bool,
+    /// v0.5.4：蓝牙音频设备（后台线程推送）与音量回声的静默窗口。
+    #[cfg(windows)]
+    bt_rx: Option<std::sync::mpsc::Receiver<Vec<windowisle::bt::Device>>>,
+    bt: Vec<windowisle::bt::Device>,
+    bt_ready: bool,
+    volume_quiet: PollClock,
+    /// v0.5.5：邮件收信服务（工作线程），以及上次同步给它的账号/开关快照。
+    mail: windowisle::mail::Service,
+    mail_sig: (bool, u32, Vec<windowisle::mail::Account>),
+    /// v0.5.6：日程（CalDAV）服务与上次下发的配置。
+    cal: windowisle::calendar::Service,
+    cal_sig: (Vec<windowisle::calendar::Config>, bool),
+    weather: windowisle::weather::Service,
+    weather_sig: (bool, String, u32),
+    /// 内存清理服务（调度线程 + 手动清理线程）与上次下发的配置。
+    mem_clean: windowisle::mem_clean::Service,
+    /// Agent 任务（DSH）数据服务与上次下发的配置。
+    dsh: windowisle::dsh_tasks::Service,
+    mem_clean_sig: (bool, u32, u8, Vec<String>),
+    dsh_sig: Option<windowisle::dsh_tasks::Config>,
+    /// 进程排行采样：只在进程页可见时运行。
+    processes: Option<windowisle::processes::Service>,
+    /// 音频可视化服务：开启设置时才启动。
+    audio: Option<windowisle::audio::Service>,
+    audio_visualizer: bool,
+    quota: windowisle::quota::Service,
+    quota_sig: Option<(bool,Vec<windowisle::quota::Account>)>,
+    quota_at: PollClock,
+    clipboard: windowisle::clipboard::Service,
+    clipboard_popup: windowisle::clipboard_ui::Popup,
+    /// 最近一次剪贴板历史快照，供命令面板搜索。
+    clipboard_items: std::sync::Arc<Vec<windowisle::clipboard::Item>>,
+    clipboard_sig: (bool, usize, u32, bool),
+    #[cfg(windows)]
+    clipboard_prev: Option<windows::Win32::Foundation::HWND>,
+    clipboard_transfer: Option<(String, bool)>,
+    clipboard_status: String,
+    /// 剪贴板图片 OCR 的后台结果。
+    ocr_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// 框选取字：整屏位图、目标显示器与全屏遮罩。
+    capture_overlay: windowisle::capture_ui::Overlay,
+    capture_purpose: windowisle::capture_ui::Purpose,
+    /// 截图标注编辑器。
+    annotate: windowisle::annotate::Editor,
+    /// 滚动截图的采集与 HUD。
+    scroll_capture: Option<windowisle::scroll_capture::Capture>,
+    /// 贴在桌面上的截图（置顶小窗）。
+    pins: Vec<windowisle::pin::Pin>,
+    pins_restored: bool,
+    pins_persist_last: bool,
+    /// 媒体控制 HUD（播放/切歌时短暂显示）。
+    media_hud: windowisle::media_hud::Hud,
+    /// 亮度 HUD。
+    brightness_hud: windowisle::brightness_hud::Hud,
+    /// 通知历史面板与数据版本。
+    notifications_popup: windowisle::notifications_ui::Popup,
+    notifications_rev: u64,
+    capture_image: Option<windowisle::ocr::Image>,
+    capture_monitor: Option<windowisle::region_capture::MonitorRect>,
+    command_palette: windowisle::command_palette::Panel,
+    /// 最近从命令面板启动的应用（持久化）。
+    recent_apps: windowisle::command_palette::RecentApps,
+    /// 系统页采样器与最近一次结果。
+    perf: windowisle::perf::Sampler,
+    perf_at: PollClock,
+    perf_value: windowisle::perf::Performance,
+    /// 当前已下发给系统的防睡眠状态。
+    stay_awake: bool,
+}
+
+impl Shell {
+    fn new(cc: &eframe::CreationContext<'_>, migrated: bool) -> Self {
+        let mut app = App::new(&cc.egui_ctx, Options::default());
+        if migrated {app.say("已从「岛仔」迁移设置和记录");}
+        #[cfg(feature="record")] let quota_demo=std::env::var("WINDOWISLE_QUOTA_DEMO").is_ok();
+        #[cfg(not(feature="record"))] let quota_demo=false;
+        if !quota_demo{app.quota_initialize();}
+        if std::env::args().any(|arg|arg=="--settings"){app.open_settings();}
+        if std::env::args().any(|arg|arg=="--calendar"){app.open_calendar(None);}
+        #[cfg(feature="record")]
+        if std::env::var("WINDOWISLE_MAIL_DEMO").is_ok(){app.mail_demo();}
+        #[cfg(feature="record")]
+        if std::env::var("WINDOWISLE_CAL_DEMO").is_ok(){app.calendar_demo();}
+        #[cfg(feature="record")]
+        if let Ok(mode)=std::env::var("WINDOWISLE_QUOTA_DEMO"){app.quota_demo(&mode);}
+        let media = smtc::shared();
+        smtc::spawn_poller(media.clone(),cc.egui_ctx.clone());
+        #[cfg(windows)]
+        let autostart = windowisle::tray::autostart_enabled();
+        #[cfg(windows)]
+        let tray = windowisle::tray::Tray::start(windowisle::tray::State {
+            pet: app.settings.pet,
+            minimal: app.settings.minimal,
+            autostart,
+        });
+        #[cfg(windows)]
+        let incoming=if app.settings.read_notifications {match windowisle::system::connect(){Ok(rx)=>Some(rx),Err(e)=>{app.listener_status=format!("Windows 无法读取通知：{}",e.code());None}}}else{None};
+        let initial_input=windowisle::input::State::read();
+        #[cfg(windows)] let system_state=windowisle::system::Snapshot::read();
+        #[cfg(windows)] let system_rx=windowisle::system::observe(cc.egui_ctx.clone(),system_state.clone(),initial_input);
+        let clipboard_enabled =
+            app.settings.clipboard_enabled && !app.settings.clipboard_paused;
+        let clipboard_limit = app.settings.clipboard_limit as usize;
+        let clipboard_days = app.settings.clipboard_days;
+        let clipboard_clean_links = app.settings.clipboard_clean_links;
+        #[cfg(windows)]
+        if app.settings.stay_awake {
+            windowisle::system::set_stay_awake(true);
+        }
+        let stay_awake = app.settings.stay_awake;
+        let audio_visualizer = app.settings.audio_visualizer;
+        let remember_pins = app.settings.remember_pins;
+        let clipboard = windowisle::clipboard::Service::start();
+        clipboard.set_enabled(clipboard_enabled);
+        clipboard.set_limits(clipboard_limit, clipboard_days);
+        clipboard.set_clean_links(app.settings.clipboard_clean_links);
+        Self {
+            app,
+            t0: Instant::now(),
+            #[cfg(windows)]
+            frame_at: Instant::now(),
+            media,
+            placed: false,
+            win_x: 0.0,
+            sys: (None, false, PollClock::default()),
+            #[cfg(windows)]
+            system_state,
+            #[cfg(windows)] system_rx,
+            fullscreen:false,
+            input_state:windowisle::input::Monitor::new(initial_input),
+            #[cfg(windows)] input_keys:windowisle::input::Shortcuts::start(),
+            #[cfg(windows)] incoming,
+            #[cfg(windows)] hidden:false,
+            #[cfg(windows)]
+            native: windowisle::native::Window::new(cc),
+            #[cfg(windows)]
+            tray,
+            #[cfg(windows)]
+            autostart,
+            #[cfg(windows)]
+            bt_rx: Some(windowisle::bt::spawn()),
+            bt: Vec::new(),
+            bt_ready: false,
+            volume_quiet: PollClock::default(),
+            mail: windowisle::mail::Service::start(),
+            mail_sig: (false, 0, Vec::new()),
+            cal: windowisle::calendar::Service::start(),
+            cal_sig: (Vec::new(), true),
+            weather: windowisle::weather::Service::start(),
+            weather_sig: (false, String::new(), 0),
+            mem_clean: windowisle::mem_clean::Service::start(),
+            dsh: windowisle::dsh_tasks::Service::start(),
+            mem_clean_sig: (false, 0, 0, Vec::new()),
+            dsh_sig: None,
+            processes: None,
+            audio: if audio_visualizer { Some(windowisle::audio::Service::start()) } else { None },
+            audio_visualizer,
+            quota: windowisle::quota::Service::start(), quota_sig: None, quota_at: PollClock::default(),
+            clipboard,
+            clipboard_popup: windowisle::clipboard_ui::Popup::default(),
+            clipboard_items: Default::default(),
+            clipboard_sig: (clipboard_enabled, clipboard_limit, clipboard_days, clipboard_clean_links),
+            #[cfg(windows)]
+            clipboard_prev: None,
+            clipboard_transfer: None,
+            clipboard_status: String::new(),
+            ocr_rx: None,
+            capture_overlay: Default::default(),
+            capture_purpose: Default::default(),
+            annotate: Default::default(),
+            scroll_capture: None,
+            pins: Vec::new(),
+            pins_restored: false,
+            pins_persist_last: remember_pins,
+            media_hud: Default::default(),
+            brightness_hud: Default::default(),
+            notifications_popup: Default::default(),
+            notifications_rev: 0,
+            capture_image: None,
+            capture_monitor: None,
+            command_palette: windowisle::command_palette::Panel::default(),
+            recent_apps: windowisle::command_palette::RecentApps::load(),
+            perf: windowisle::perf::Sampler::new(),
+            perf_at: PollClock::default(),
+            perf_value: Default::default(),
+            stay_awake,
+        }
+    }
+
+    #[cfg(windows)]
+    fn poll_tray(&mut self, ctx: &egui::Context) {
+        use windowisle::tray::{self, Event};
+        let events = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
+        for e in events {
+            match e {
+                Event::OpenSettings=>self.app.open_settings(),
+                Event::OpenCalendar=>self.app.open_calendar(None),
+                Event::OpenClipboard=>self.open_clipboard(ctx, false),
+                Event::OpenCommandPalette=>self.open_command_palette(ctx),
+                Event::OcrClipboard=>self.run_ocr(ctx),
+                Event::CropOcr=>self.start_region_ocr(ctx),
+                Event::OpenNotifications=>self.open_notifications(ctx),
+                Event::Screenshot=>self.start_region_screenshot(ctx),
+                Event::ScrollCapture=>self.start_region_scroll(ctx),
+                Event::TogglePet => {
+                    self.app.set_pet(!self.app.settings.pet);
+                    self.app.say(if self.app.settings.pet { "吉祥物已打开" } else { "吉祥物已关闭" });
+                }
+                Event::ToggleMinimal => {
+                    self.app.set_minimal(!self.app.settings.minimal);
+                    self.app.say(if self.app.settings.minimal { "极简刘海已打开" } else { "极简刘海已关闭" });
+                }
+                Event::ToggleAutostart => {
+                    let want = !self.autostart;
+                    match tray::set_autostart(want) {
+                        Ok(()) => {
+                            self.autostart = want;
+                            self.app.say(if want { "已设为开机启动" } else { "已取消开机启动" });
+                        }
+                        Err(e) => self.app.say(e),
+                    }
+                }
+            }
+        }
+        if let Some(t) = &self.tray {
+            t.sync(tray::State { pet: self.app.settings.pet, minimal: self.app.settings.minimal, autostart: self.autostart });
+        }
+    }
+
+    fn open_clipboard(&mut self, ctx: &egui::Context, restore: bool) {
+        self.annotate.close();
+        self.close_notifications();
+        self.command_palette.close();
+        #[cfg(windows)]
+        {
+            let previous = if restore { windowisle::native::external_foreground_window() } else { None };
+            self.clipboard_prev = previous;
+            self.clipboard_popup.set_target_label(previous.and_then(|hwnd| windowisle::native::foreground_window_label(Some(hwnd))));
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = restore;
+            self.clipboard_popup.set_target_label(None);
+        }
+        let hotkey_error = self.clipboard_hotkey_error();
+        self.clipboard_popup.open_state(
+            self.app.settings.clipboard_enabled,
+            self.app.settings.clipboard_paused,
+            hotkey_error,
+        );
+        self.clipboard.refresh();
+        ctx.request_repaint();
+    }
+
+    fn close_clipboard(&mut self, restore: bool) {
+        self.clipboard_popup.close();
+        #[cfg(windows)]
+        {
+            if restore {
+                windowisle::native::restore_foreground(self.clipboard_prev.take());
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = restore;
+    }
+
+    fn clipboard_hotkey_error(&self) -> Option<String> {
+        #[cfg(windows)]
+        {
+            let mut errors = Vec::new();
+            if let Some(error) = self.native.as_ref().and_then(|native| native.hotkey_error.clone()) { errors.push(error); }
+            if self.app.settings.clipboard_win_v {
+                match self.input_keys.as_ref() {
+                    None => errors.push("Win+V 接管未启动，系统快捷键仍有效；请使用 Ctrl+Alt+V".into()),
+                    Some(keys) if keys.win_v_failed() => errors.push("Win+V 接管失败，已恢复系统行为；可关闭再打开开关重试".into()),
+                    _ => {}
+                }
+            }
+            (!errors.is_empty()).then(|| errors.join("；"))
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
+    fn sync_clipboard_shortcut(&mut self, ctx: &egui::Context) {
+        #[cfg(windows)]
+        {
+            if let Some(keys) = self.input_keys.as_ref() {
+                keys.configure_win_v(self.app.settings.clipboard_win_v, ctx);
+            }
+            self.clipboard_popup.set_win_v_active(self.input_keys.as_ref().is_some_and(|keys| keys.win_v_enabled()));
+        }
+        #[cfg(not(windows))]
+        let _ = ctx;
+    }
+
+    fn poll_clipboard(&mut self) {
+        // A pinned clipboard can span several applications. Track the last
+        // external foreground window, but freeze it while a copy is in flight.
+        #[cfg(windows)]
+        if self.clipboard_popup.is_window_pinned() && self.clipboard_transfer.is_none() {
+            if let Some(target) = windowisle::native::external_foreground_window() {
+                if self.clipboard_prev != Some(target) {
+                    self.clipboard_prev = Some(target);
+                    self.clipboard_popup.set_target_label(windowisle::native::foreground_window_label(Some(target)));
+                }
+            }
+        }
+        let settings = &self.app.settings;
+        let signature = (
+            settings.clipboard_enabled && !settings.clipboard_paused,
+            settings.clipboard_limit as usize,
+            settings.clipboard_days,
+            settings.clipboard_clean_links,
+        );
+        if signature != self.clipboard_sig {
+            self.clipboard.set_limits(signature.1, signature.2);
+            self.clipboard.set_enabled(signature.0);
+            self.clipboard.set_clean_links(signature.3);
+            self.clipboard_sig = signature;
+        }
+        while let Some(event) = self.clipboard.try_recv() {
+            match event {
+                windowisle::clipboard::Event::Changed(items) => {
+                    self.clipboard_popup.set_shared_items(items.clone());
+                    self.clipboard_items = items;
+                    if self.command_palette.is_open() {
+                        let entries = self.palette_clipboard_entries();
+                        self.command_palette.set_clipboard(entries);
+                    }
+                }
+                windowisle::clipboard::Event::Copied(_) => {
+                    if let Some((id, paste)) = self.clipboard_transfer.take() {
+                        if paste {
+                            #[cfg(windows)] {
+                                let target = self.clipboard_prev;
+                                if !self.clipboard_popup.is_window_pinned() {
+                                    self.clipboard_prev = None;
+                                    self.close_clipboard(false);
+                                }
+                                if let Err(error) = windowisle::native::restore_and_paste(target) {
+                                    self.app.say(format!("已复制，请手动粘贴：{error}"));
+                                }
+                            }
+                            #[cfg(not(windows))]
+                            {
+                                let _ = id;
+                                if !self.clipboard_popup.is_window_pinned() {
+                                    self.close_clipboard(false);
+                                }
+                                self.app.say("已复制，请手动粘贴");
+                            }
+                        } else {
+                            let restore = self.clipboard_prev.is_some();
+                            if self.clipboard_popup.is_window_pinned() {
+                                #[cfg(windows)]
+                                windowisle::native::restore_foreground(self.clipboard_prev);
+                            } else {
+                                self.close_clipboard(restore);
+                            }
+                            let _ = id;
+                        }
+                    } else {
+                        self.app.say("已复制");
+                    }
+                }
+                windowisle::clipboard::Event::CopyFailed(_, message) => {
+                    self.clipboard_transfer = None;
+                    self.clipboard_popup.set_error(message.clone());
+                    self.app.say(message);
+                }
+                windowisle::clipboard::Event::Status(message) => {
+                    if !message.trim().is_empty() {
+                        self.clipboard_popup.set_error(message.clone());
+                    }
+                    self.clipboard_status = message;
+                }
+            }
+        }
+        let hotkey_error = self.clipboard_hotkey_error();
+        self.app.clipboard_status = hotkey_error.clone().unwrap_or_else(|| self.clipboard_status.clone());
+        self.clipboard_popup.sync(
+            self.app.settings.clipboard_enabled,
+            self.app.settings.clipboard_paused,
+            hotkey_error,
+        );
+    }
+
+    fn notification_status(&self) -> String {
+        let base = if self.incoming.is_some() {
+            if self.app.listener_status.trim().is_empty() {
+                "正在监听 Windows 通知".to_string()
+            } else {
+                self.app.listener_status.clone()
+            }
+        } else {
+            "未连接 Windows 通知 · 在「设置 → 通知」连接".to_string()
+        };
+        if self.app.settings.notifications {
+            base
+        } else {
+            format!("岛上提醒已关闭 · {base}")
+        }
+    }
+
+    /// 手动清理；服务未连上时懒安装 / 修复（一次 UAC），连上后自动补发。
+    fn clean_memory(&mut self) {
+        if self.app.mem_installing() {
+            return; // 安装进行中：连上后会自动补发，不重复弹 UAC。
+        }
+        self.app.mem_clean_started();
+        if self.app.mem_connected() {
+            self.mem_clean.clean_now();
+            return;
+        }
+        self.app.set_pending_clean(true);
+        self.install_clean_service();
+    }
+
+    /// 安装 / 修复 / 更新清理服务。UAC 被拒或缺少组件时立即提示；
+    /// 同意后由客户端线程等安装结束并重连，结果经事件回传。
+    fn install_clean_service(&mut self) {
+        if self.app.mem_installing() {
+            return;
+        }
+        match self.mem_clean.install() {
+            Ok(()) => self.app.mem_install_started(),
+            Err(error) => self.app.mem_clean_event(windowisle::mem_clean::Event::Failed { manual: true, error }),
+        }
+    }
+
+    fn open_notifications(&mut self, ctx: &egui::Context) {
+        self.annotate.close();
+        if self.capture_overlay.open {
+            return;
+        }
+        if self.notifications_popup.is_open() {
+            self.close_notifications();
+            return;
+        }
+        if !self.clipboard_popup.is_window_pinned() {
+            self.close_clipboard(false);
+        }
+        self.command_palette.close();
+        self.app.notifications_mark_seen();
+        self.notifications_popup.open(
+            self.app.notifications_snapshot(),
+            self.app.notifications_unread(),
+            self.notification_status(),
+        );
+        self.notifications_rev = self.app.notifications_revision();
+        ctx.request_repaint();
+    }
+
+    fn palette_clipboard_entries(&self) -> Vec<windowisle::command_palette::ClipboardItem> {
+        self.clipboard_items
+            .iter()
+            .map(|item| windowisle::command_palette::ClipboardItem { id: item.id.clone(), text: item.text.clone() })
+            .collect()
+    }
+
+    fn close_notifications(&mut self) {
+        self.notifications_popup.close();
+    }
+
+    fn show_notifications(&mut self, ctx: &egui::Context) {
+        if !self.notifications_popup.is_open() {
+            return;
+        }
+        let revision = self.app.notifications_revision();
+        if revision != self.notifications_rev {
+            self.notifications_rev = revision;
+            self.notifications_popup.sync(
+                self.app.notifications_snapshot(),
+                self.app.notifications_unread(),
+            );
+        }
+        let dark = windowisle::settings_theme::system_dark(ctx);
+        match self.notifications_popup.show(ctx, dark) {
+            windowisle::notifications_ui::Action::None => {}
+            windowisle::notifications_ui::Action::Close => self.close_notifications(),
+            windowisle::notifications_ui::Action::Copy(text) => {
+                ctx.copy_text(text);
+                self.app.say("已复制通知内容");
+            }
+            windowisle::notifications_ui::Action::Delete(id) => {
+                self.app.notifications_delete(&id);
+                self.notifications_popup.sync(
+                    self.app.notifications_snapshot(),
+                    self.app.notifications_unread(),
+                );
+            }
+            windowisle::notifications_ui::Action::OpenApp(source_id) => {
+                if !open_notification_source(&source_id) {
+                    self.app.say("无法打开通知来源应用");
+                }
+            }
+            windowisle::notifications_ui::Action::MuteApp(source_id, app) => {
+                if self.app.mute_notification_app(&source_id, &app) {
+                    self.app.say(format!("已静音「{app}」的通知"));
+                } else {
+                    self.app.say(format!("「{app}」已经在静音列表中"));
+                }
+            }
+            windowisle::notifications_ui::Action::Clear => {
+                self.app.notifications_clear();
+                self.notifications_popup.sync(Vec::new(), 0);
+                self.app.say("已清空通知历史");
+            }
+        }
+    }
+
+    fn show_clipboard(&mut self, ctx: &egui::Context) {
+        // 快捷面板跟随系统深浅色，和设置页保持同一套观感。
+        let dark = windowisle::settings_theme::system_dark(ctx);
+        match self.clipboard_popup.show(ctx, dark) {
+            windowisle::clipboard_ui::Action::None => {}
+            windowisle::clipboard_ui::Action::Paste(id) => self.begin_clipboard_transfer(id, true),
+            windowisle::clipboard_ui::Action::CopyOnly(id) => self.begin_clipboard_transfer(id, false),
+            windowisle::clipboard_ui::Action::Delete(id) => self.clipboard.delete(&id),
+            windowisle::clipboard_ui::Action::Restore(item) => self.clipboard.restore(item),
+            windowisle::clipboard_ui::Action::Pin(id, pinned) => self.clipboard.pin(&id, pinned),
+            windowisle::clipboard_ui::Action::Enable => {
+                self.app.settings.clipboard_enabled = true;
+                self.app.settings.save();
+            }
+            windowisle::clipboard_ui::Action::Resume => {
+                self.app.settings.clipboard_paused = false;
+                self.app.settings.save();
+            }
+            windowisle::clipboard_ui::Action::SetPaused(paused) => {
+                self.app.settings.clipboard_paused = paused;
+                self.app.settings.save();
+                self.clipboard_popup.sync(
+                    self.app.settings.clipboard_enabled,
+                    paused,
+                    self.clipboard_hotkey_error(),
+                );
+            }
+            windowisle::clipboard_ui::Action::Clear => self.clipboard.clear(),
+            windowisle::clipboard_ui::Action::OcrClipboard => {
+                self.close_clipboard(false);
+                self.run_ocr(ctx);
+            }
+            windowisle::clipboard_ui::Action::CropOcr => {
+                self.close_clipboard(false);
+                self.start_region_ocr(ctx);
+            }
+            windowisle::clipboard_ui::Action::OcrImage(id) => {
+                self.close_clipboard(false);
+                let image = self
+                    .clipboard_items
+                    .iter()
+                    .find(|item| item.id == id)
+                    .and_then(|item| item.image.as_ref())
+                    .and_then(windowisle::clipboard::load_image);
+                match image {
+                    Some(image) => self.start_ocr_image(ctx, image),
+                    None => self.app.say("图片已被清理，无法识别"),
+                }
+            }
+            windowisle::clipboard_ui::Action::OpenSettings => {
+                self.close_clipboard(false);
+                self.app.open_settings();
+                ctx.request_repaint();
+            }
+            windowisle::clipboard_ui::Action::Close { restore } => self.close_clipboard(restore),
+        }
+    }
+
+    fn begin_clipboard_transfer(&mut self, id: String, paste: bool) {
+        if self.clipboard_transfer.is_some() {
+            return;
+        }
+        self.clipboard_popup.clear_error();
+        self.clipboard_transfer = Some((id.clone(), paste));
+        self.clipboard.copy(&id);
+    }
+
+    /// 打开框选取字层：先抓整屏位图，再让用户框选，避免遮罩被拍进图片。
+    fn start_region_ocr(&mut self, ctx: &egui::Context) {
+        self.start_region_capture(ctx, windowisle::capture_ui::Purpose::Ocr);
+    }
+
+    /// 打开框选截图层：框选后复制到剪贴板并保存 PNG。
+    fn start_region_screenshot(&mut self, ctx: &egui::Context) {
+        self.start_region_capture(ctx, windowisle::capture_ui::Purpose::Screenshot);
+    }
+
+    fn start_region_capture(&mut self, ctx: &egui::Context, purpose: windowisle::capture_ui::Purpose) {
+        if self.scroll_capture.is_some() {
+            self.app.say("正在滚动截图，先按 Ctrl+Alt+Shift+L 完成");
+            return;
+        }
+        self.annotate.close();
+        if self.capture_overlay.open {
+            return;
+        }
+        if purpose == windowisle::capture_ui::Purpose::Ocr && self.ocr_rx.is_some() {
+            self.app.say("正在识别上一张图片，请稍候");
+            return;
+        }
+        // 框选层全屏覆盖，先收起其它浮层，避免遮挡屏幕。
+        if self.clipboard_popup.open {
+            self.close_clipboard(false);
+        }
+        if self.command_palette.is_open() {
+            self.command_palette.close();
+        }
+        if self.notifications_popup.is_open() {
+            self.close_notifications();
+        }
+        let Some(monitor) = windowisle::region_capture::monitor_at_cursor() else {
+            self.app.say("没有找到可用显示器");
+            return;
+        };
+        match windowisle::region_capture::capture_region(monitor) {
+            Ok(image) => {
+                self.capture_image = Some(image);
+                self.capture_monitor = Some(monitor);
+                self.capture_purpose = purpose;
+                self.capture_overlay.open(monitor, purpose);
+                ctx.request_repaint();
+            }
+            Err(error) => self.app.say(format!("无法截取屏幕：{error}")),
+        }
+    }
+
+    fn show_capture_overlay(&mut self, ctx: &egui::Context) {
+        use windowisle::capture_ui::Action as CaptureAction;
+        if !self.capture_overlay.open {
+            return;
+        }
+        let ppp = ctx.pixels_per_point();
+        match self.capture_overlay.show(ctx, ppp) {
+            CaptureAction::None => {}
+            CaptureAction::Cancel => self.close_capture_overlay(),
+            CaptureAction::Capture { x, y, width, height } => {
+                self.capture_overlay.close();
+                let purpose = self.capture_purpose;
+                let monitor = self.capture_monitor.take();
+                let Some(image) = self.capture_image.take() else {
+                    return;
+                };
+                match windowisle::region_capture::crop(&image, x, y, width, height) {
+                    Ok(cropped) => match purpose {
+                        windowisle::capture_ui::Purpose::Ocr => self.start_ocr_image(ctx, cropped),
+                        windowisle::capture_ui::Purpose::Screenshot => self.finish_screenshot(ctx, cropped),
+                        windowisle::capture_ui::Purpose::Scroll => {
+                            if let Some(monitor) = monitor {
+                                self.start_scroll_capture(ctx, monitor, (x, y, width, height), cropped);
+                            }
+                        }
+                    },
+                    Err(error) => self.app.say(error),
+                }
+            }
+        }
+    }
+
+    /// 截图完成：进入标注编辑器，复制/保存由编辑器决定。
+    fn finish_screenshot(&mut self, ctx: &egui::Context, image: windowisle::ocr::Image) {
+        self.annotate.open(ctx, image);
+        ctx.request_repaint();
+    }
+
+    fn brightness_step(&mut self, delta: f32) {
+        let state = windowisle::brightness::adjust(delta);
+        self.brightness_hud.show(state);
+    }
+
+    fn media_control(&mut self, transport: windowisle::smtc::Transport, action: &'static str) {
+        let state = self.media.lock().map(|media| media.clone()).unwrap_or_default();
+        let mut shown = state.clone();
+        if matches!(transport, windowisle::smtc::Transport::Toggle) {
+            shown.playing = !shown.playing;
+        }
+        windowisle::smtc::control(transport, &state.source);
+        self.media_hud.show(shown, action);
+    }
+
+    fn volume_step(&mut self, delta: f32) {
+        match windowisle::volume::adjust(delta) {
+            Some(state) => self.show_volume_hud(state.level, state.muted),
+            None => self.app.say("无法读取系统音量"),
+        }
+    }
+
+    fn volume_toggle_mute(&mut self) {
+        match windowisle::volume::toggle_mute() {
+            Some(state) => self.show_volume_hud(state.level, state.muted),
+            None => self.app.say("无法读取系统音量"),
+        }
+    }
+
+    /// 音量变化统一交给岛体顶部的系统 HUD（与硬件音量键一致，可拖动调节）。
+    fn show_volume_hud(&mut self, level: f32, muted: bool) {
+        let percent = (level * 100.0).round() as u32;
+        self.app.show_volume_ui(percent, muted);
+        self.volume_quiet = PollClock::now();
+        if self.app.settings.system_hud {
+            self.app.alert(
+                "系统音量",
+                if muted { "已静音".to_string() } else { format!("音量 {percent}%") },
+                5,
+                false,
+            );
+        }
+    }
+
+    fn start_region_scroll(&mut self, ctx: &egui::Context) {
+        self.start_region_capture(ctx, windowisle::capture_ui::Purpose::Scroll);
+    }
+
+    fn start_scroll_capture(
+        &mut self,
+        ctx: &egui::Context,
+        monitor: windowisle::region_capture::MonitorRect,
+        selection: (i32, i32, u32, u32),
+        first: windowisle::ocr::Image,
+    ) {
+        match windowisle::scroll_capture::Capture::start(ctx, monitor, selection, first) {
+            Some(capture) => {
+                self.scroll_capture = Some(capture);
+                self.app.say("滚动页面开始拼接，完成后按 Ctrl+Alt+Shift+L");
+                ctx.request_repaint();
+            }
+            None => self.app.say("选区太小，无法开始滚动截图"),
+        }
+    }
+
+    fn show_scroll_capture(&mut self, ctx: &egui::Context) {
+        let Some(capture) = self.scroll_capture.as_mut() else { return };
+        let event = capture.poll(ctx);
+        match event {
+            windowisle::scroll_capture::Event::None => {}
+            windowisle::scroll_capture::Event::Finished(image) => {
+                self.scroll_capture = None;
+                self.annotate.open(ctx, image);
+                self.app.say("滚动截图已生成，可标注、复制或保存");
+            }
+            windowisle::scroll_capture::Event::Cancelled => {
+                self.scroll_capture = None;
+                self.app.say("已取消滚动截图");
+            }
+        }
+    }
+
+    fn finish_scroll_capture(&mut self, ctx: &egui::Context) {
+        let Some(capture) = self.scroll_capture.as_mut() else { return };
+        if let Some(image) = capture.finish() {
+            self.scroll_capture = None;
+            self.annotate.open(ctx, image);
+            self.app.say("滚动截图已生成，可标注、复制或保存");
+        }
+    }
+
+    fn show_pins(&mut self, ctx: &egui::Context) {
+        if !self.pins_restored {
+            self.pins_restored = true;
+            if self.app.settings.remember_pins {
+                self.restore_pins(ctx);
+            }
+        }
+        if self.pins.is_empty() {
+            return;
+        }
+        let dark = windowisle::settings_theme::system_dark(ctx);
+        let mut removed = false;
+        self.pins.retain_mut(|pin| {
+            let closed = pin.show(ctx, dark);
+            if closed {
+                if let Some(key) = pin.persist_key() {
+                    windowisle::pin_store::remove_image(&windowisle::pin_store::dir(), key);
+                }
+                removed = true;
+            }
+            !closed
+        });
+        if removed {
+            self.save_pin_metadata();
+        }
+    }
+
+    fn add_pin(&mut self, ctx: &egui::Context, image: windowisle::ocr::Image) {
+        if self.pins.len() >= 6 {
+            self.app.say("最多同时贴 6 张图，先右键关闭一些吧");
+            return;
+        }
+        let ppp = ctx.pixels_per_point();
+        let key = if self.app.settings.remember_pins {
+            let key = windowisle::pin_store::new_key();
+            match windowisle::pin_store::save_image(&windowisle::pin_store::dir(), &key, &image) {
+                Ok(()) => Some(key),
+                Err(error) => {
+                    self.app.say(format!("无法保存贴图：{error}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let mut pin = windowisle::pin::Pin::new(image, ppp);
+        if let Some(key) = key {
+            pin.set_persist_key(key);
+        }
+        pin.place_near_cursor(ppp);
+        self.pins.push(pin);
+        self.save_pin_metadata();
+        self.app.say("已贴到桌面，右键或双击关闭");
+    }
+
+    fn restore_pins(&mut self, ctx: &egui::Context) {
+        let ppp = ctx.pixels_per_point();
+        let root = windowisle::pin_store::dir();
+        for record in windowisle::pin_store::load_records() {
+            if self.pins.len() >= 6 {
+                break;
+            }
+            let Some(image) = windowisle::pin_store::load_image(&root, &record.key) else {
+                windowisle::pin_store::remove_image(&root, &record.key);
+                continue;
+            };
+            let mut pin = windowisle::pin::Pin::restore(
+                image,
+                ppp,
+                egui::pos2(record.x, record.y),
+                record.zoom,
+                record.opacity,
+                record.key,
+            );
+            pin.clamp_visible(ppp);
+            self.pins.push(pin);
+        }
+        if !self.pins.is_empty() {
+            self.app.say(format!("已恢复 {} 张贴图", self.pins.len()));
+        }
+    }
+
+    fn save_pin_metadata(&mut self) {
+        if !self.app.settings.remember_pins {
+            return;
+        }
+        let records: Vec<_> = self
+            .pins
+            .iter()
+            .filter_map(|pin| pin.metadata())
+            .collect();
+        if let Err(error) = windowisle::pin_store::save_records(&records) {
+            self.app.say(error);
+        }
+    }
+
+    fn clear_pin_storage(&mut self) {
+        for pin in &mut self.pins {
+            pin.clear_persist_key();
+        }
+        windowisle::pin_store::clear();
+    }
+
+    fn show_annotate(&mut self, ctx: &egui::Context) {
+        if !self.annotate.is_open() {
+            return;
+        }
+        use windowisle::annotate::Action as AnnotateAction;
+        let dark = windowisle::settings_theme::system_dark(ctx);
+        match self.annotate.show(ctx, dark) {
+            AnnotateAction::None => {}
+            AnnotateAction::Close => self.annotate.close(),
+            AnnotateAction::Copy(image) => {
+                #[cfg(windows)]
+                windowisle::screenshot::copy_to_clipboard(&image);
+                self.app.say("已复制标注截图");
+                self.annotate.close();
+            }
+            AnnotateAction::Save(image) => {
+                match windowisle::screenshot::save_png(&image) {
+                    Ok(path) => self.app.say(format!("标注截图已保存到 {}", path.display())),
+                    Err(error) => self.app.say(format!("保存标注截图失败：{error}")),
+                }
+                self.annotate.close();
+            }
+            AnnotateAction::Pin(image) => {
+                self.annotate.close();
+                self.add_pin(ctx, image);
+            }
+        }
+    }
+
+
+    fn close_capture_overlay(&mut self) {
+        self.capture_overlay.close();
+        self.capture_image = None;
+        self.capture_monitor = None;
+    }
+
+    /// 对一段已经截好的 RGBA 图像跑 OCR（框选取字）。
+    fn start_ocr_image(&mut self, ctx: &egui::Context, image: windowisle::ocr::Image) {
+        if self.ocr_rx.is_some() {
+            self.app.say("正在识别上一张图片，请稍候");
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.ocr_rx = Some(rx);
+        self.app.say("正在识别图片文字…");
+        ctx.request_repaint();
+        std::thread::Builder::new()
+            .name("windowisle-ocr-region".into())
+            .spawn(move || {
+                let _ = tx.send(windowisle::ocr::recognize_rgba(&image.rgba, image.width, image.height));
+            })
+            .ok();
+    }
+
+    /// 识别剪贴板图片里的文字：后台线程跑 Windows OCR，主线程只收结果。
+    fn run_ocr(&mut self, ctx: &egui::Context) {
+        if self.ocr_rx.is_some() {
+            self.app.say("正在识别上一张图片，请稍候");
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.ocr_rx = Some(rx);
+        self.app.say("正在识别剪贴板图片…");
+        ctx.request_repaint();
+        std::thread::Builder::new()
+            .name("windowisle-ocr".into())
+            .spawn(move || {
+                let _ = tx.send(windowisle::ocr::recognize_clipboard());
+            })
+            .ok();
+    }
+
+    fn poll_ocr(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.ocr_rx else { return };
+        let mut finished = None;
+        match rx.try_recv() {
+            Ok(result) => finished = Some(result),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                finished = Some(Err("识别线程已退出".into()))
+            }
+        }
+        let Some(result) = finished else { return };
+        self.ocr_rx = None;
+        match result {
+            Ok(text) => {
+                let count = text.chars().filter(|ch| !ch.is_whitespace()).count();
+                if count == 0 {
+                    self.app.say("没有识别到文字");
+                    return;
+                }
+                ctx.copy_text(text.clone());
+                self.clipboard.insert(text);
+                self.app.say(format!("已识别 {count} 个字，已复制到剪贴板"));
+            }
+            Err(message) => self.app.say(message),
+        }
+    }
+
+    fn open_command_palette(&mut self, ctx: &egui::Context) {
+        self.annotate.close();
+        self.close_notifications();
+        // Pinned clipboard stays available; it never requests focus again.
+        if self.clipboard_popup.open && !self.clipboard_popup.is_window_pinned() {
+            self.close_clipboard(false);
+        }
+        let mut snapshot = self.app.palette_snapshot();
+        snapshot.pins = self.pins.len();
+        self.command_palette.set_recent(self.recent_apps.items());
+        self.command_palette.open(&snapshot);
+        let entries = self.palette_clipboard_entries();
+        self.command_palette.set_clipboard(entries);
+        #[cfg(windows)]
+        let error = self.native.as_ref().and_then(|native| native.command_hotkey_error.clone());
+        #[cfg(not(windows))]
+        let error = None;
+        self.command_palette.set_hotkey_error(error);
+        ctx.request_repaint();
+    }
+
+    fn close_command_palette(&mut self) {
+        self.command_palette.close();
+        self.command_palette.set_clipboard(Vec::new());
+    }
+
+    fn show_command_palette(&mut self, ctx: &egui::Context) {
+        use windowisle::command_palette::Action as PaletteAction;
+        if !self.command_palette.is_open() {
+            return;
+        }
+        // 命令面板与剪贴板共用同一套浮层外观，跟随系统深浅色。
+        let dark = windowisle::settings_theme::system_dark(ctx);
+        match self.command_palette.show(ctx, dark) {
+            PaletteAction::None => {}
+            PaletteAction::Close => self.close_command_palette(),
+            PaletteAction::OpenSettings(tab) => {
+                self.close_command_palette();
+                self.app.open_settings_tab(tab);
+                ctx.request_repaint();
+            }
+            PaletteAction::OpenPage(page) => {
+                self.close_command_palette();
+                self.app.show_page(page);
+            }
+            PaletteAction::OpenCalendar => {
+                self.close_command_palette();
+                self.app.open_calendar(None);
+            }
+            PaletteAction::OpenClipboard => {
+                self.close_command_palette();
+                self.open_clipboard(ctx, true);
+            }
+            PaletteAction::LaunchApp(path) => {
+                self.close_command_palette();
+                let name = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("应用").to_string();
+                if let Err(error) = open_path(&path) {
+                    self.app.say(format!("无法启动应用：{error}"));
+                } else {
+                    self.recent_apps.record(&name, &path);
+                }
+            }
+            PaletteAction::CopyText(text) => {
+                self.close_command_palette();
+                ctx.copy_text(text);
+                self.app.say("已复制计算结果");
+            }
+            PaletteAction::SetClipboardPaused(paused) => {
+                self.close_command_palette();
+                self.app.settings.clipboard_paused = paused;
+                self.app.settings.save();
+                self.app.say(if paused { "剪贴板记录已暂停" } else { "剪贴板记录已恢复" });
+            }
+            PaletteAction::SetClipboardEnabled(enabled) => {
+                self.close_command_palette();
+                self.app.settings.clipboard_enabled = enabled;
+                if enabled {
+                    self.app.settings.clipboard_paused = false;
+                }
+                self.app.settings.save();
+                self.app.say(if enabled { "已开启剪贴板历史" } else { "已关闭剪贴板历史" });
+            }
+            PaletteAction::ToggleFocus => {
+                self.close_command_palette();
+                self.app.toggle_focus();
+            }
+            PaletteAction::OcrClipboard => {
+                self.close_command_palette();
+                self.run_ocr(ctx);
+            }
+            PaletteAction::CropOcr => {
+                self.close_command_palette();
+                self.start_region_ocr(ctx);
+            }
+            PaletteAction::StartCountdown(minutes) => {
+                self.close_command_palette();
+                self.app.start_countdown(minutes);
+                self.app.say(format!("开始 {minutes} 分钟倒计时"));
+            }
+            PaletteAction::ToggleTimer => {
+                self.close_command_palette();
+                let running = self.app.toggle_timer();
+                self.app.say(if running { "计时继续" } else { "计时已暂停" });
+            }
+            PaletteAction::ResetTimer => {
+                self.close_command_palette();
+                self.app.reset_timer();
+                self.app.say("计时已重置");
+            }
+            PaletteAction::RefreshWeather => {
+                self.close_command_palette();
+                self.app.request_weather_refresh();
+                self.app.say("正在刷新天气…");
+            }
+            PaletteAction::OpenNotifications => {
+                self.close_command_palette();
+                self.open_notifications(ctx);
+            }
+            PaletteAction::ScreenshotRegion => {
+                self.close_command_palette();
+                self.start_region_screenshot(ctx);
+            }
+            PaletteAction::ScrollCapture => {
+                self.close_command_palette();
+                self.start_region_scroll(ctx);
+            }
+            PaletteAction::VolumeUp => {
+                self.close_command_palette();
+                self.volume_step(windowisle::volume::STEP);
+            }
+            PaletteAction::VolumeDown => {
+                self.close_command_palette();
+                self.volume_step(-windowisle::volume::STEP);
+            }
+            PaletteAction::VolumeMute => {
+                self.close_command_palette();
+                self.volume_toggle_mute();
+            }
+            PaletteAction::CleanMemory => {
+                self.close_command_palette();
+                self.clean_memory();
+            }
+            PaletteAction::MediaPlayPause => {
+                self.close_command_palette();
+                self.media_control(windowisle::smtc::Transport::Toggle, "播放 / 暂停");
+            }
+            PaletteAction::MediaNext => {
+                self.close_command_palette();
+                self.media_control(windowisle::smtc::Transport::Next, "下一首");
+            }
+            PaletteAction::MediaPrev => {
+                self.close_command_palette();
+                self.media_control(windowisle::smtc::Transport::Prev, "上一首");
+            }
+            PaletteAction::BrightnessUp => {
+                self.close_command_palette();
+                self.brightness_step(windowisle::brightness::STEP);
+            }
+            PaletteAction::BrightnessDown => {
+                self.close_command_palette();
+                self.brightness_step(-windowisle::brightness::STEP);
+            }
+            PaletteAction::CopyClipboard(id) => {
+                self.close_command_palette();
+                self.clipboard.copy(&id);
+            }
+            PaletteAction::ClosePins => {
+                self.close_command_palette();
+                let count = self.pins.len();
+                let root = windowisle::pin_store::dir();
+                for pin in &self.pins {
+                    if let Some(key) = pin.persist_key() {
+                        windowisle::pin_store::remove_image(&root, key);
+                    }
+                }
+                self.pins.clear();
+                self.save_pin_metadata();
+                self.app.say(format!("已关闭 {count} 张贴图"));
+            }
+            PaletteAction::SetStayAwake(awake) => {
+                self.close_command_palette();
+                self.app.settings.stay_awake = awake;
+                self.app.settings.save();
+                self.app.say(if awake { "已开启防睡眠" } else { "已关闭防睡眠" });
+            }
+        }
+    }
+
+    fn env(&mut self, ctx: &egui::Context) -> Env {
+        let (clock, today, date) = local_now();
+        // 电量变化很慢，每 5 秒读一次就够
+        if self.sys.2.ready(Duration::from_secs(5)) {
+            let (b, c) = read_power();
+            if self.app.settings.show_battery && self.sys.0.is_some() && self.sys.1!=c && self.app.settings.system_hud {self.app.alert(if c {"电源已连接"}else{"已切换电池供电"},b.map(|v|format!("当前电量 {v}%")).unwrap_or_else(||"桌面电源状态已更新".into()),5,false);}
+            if self.app.settings.show_battery && b.is_some_and(|v|v<=20) && !c && self.sys.0.is_some_and(|v|v>20) {self.app.alert("电量偏低",format!("剩余 {}% · 请连接电源",b.unwrap()),5,true);}
+            self.sys = (b, c, PollClock::now());
+        }
+        let ppp = ctx.pixels_per_point();
+        let origin = ctx.input(|i| i.viewport().outer_rect).map(|r| r.min).unwrap_or(Pos2::new(self.win_x, 0.0));
+        let cursor = cursor_logical(ppp).map(|(x, y)| Pos2::new(x - origin.x, y - origin.y));
+        // 系统页：按秒采样，CPU 百分比需要两次累计值之差。
+        if self.perf_at.ready(Duration::from_millis(1000)) {
+            self.perf_value = self.perf.sample();
+            self.perf_at = PollClock::now();
+        }
+        Env {
+            t: self.t0.elapsed().as_secs_f64(),
+            clock,
+            today,
+            date,
+            battery: self.sys.0,
+            charging: self.sys.1,
+            network: Some(self.system_state.network),
+            cursor,
+            idle_seconds: {
+                #[cfg(windows)] {Some(windowisle::system::idle_seconds())}
+                #[cfg(not(windows))] {None}
+            },
+            browser_at_top: {
+                #[cfg(windows)] {if self.app.settings.browser_minimal {self.native.as_mut().and_then(|native|native.browser_at_top())}else{None}}
+                #[cfg(not(windows))] {None}
+            },
+            media: self.media.lock().map(|m| m.clone()).unwrap_or_default(),
+            volume: self.system_state.volume,
+            bt: self.bt.clone(),
+            bt_ready: self.bt_ready,
+            cpu: self.perf_value.cpu,
+            memory: self.perf_value.memory,
+            network_rates: self.perf_value.network,
+            disk: self.perf_value.disk,
+        }
+    }
+}
+
+impl eframe::App for Shell {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0; 4]
+    }
+
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.sync_clipboard_shortcut(ctx);
+        if self.app.settings.stay_awake != self.stay_awake {
+            self.stay_awake = self.app.settings.stay_awake;
+            #[cfg(windows)]
+            windowisle::system::set_stay_awake(self.stay_awake);
+            self.app.say(if self.stay_awake { "已开启防睡眠" } else { "已关闭防睡眠" });
+        }
+        #[cfg(windows)]
+        {
+            // 用帧间隔限制刷新，绕过部分 Intel 驱动在垂直同步中的忙等待。
+            let delay=Duration::from_secs_f64(1.0/60.0).saturating_sub(self.frame_at.elapsed());
+            if !delay.is_zero(){std::thread::sleep(delay);}
+            self.frame_at=Instant::now();
+        }
+        #[cfg(windows)]
+        self.poll_tray(ctx);
+        #[cfg(windows)]
+        {
+            // 一次只消费一次热键；框选层打开期间不再响应其他浮层热键。
+            let screen_ocr = windowisle::native::take_crop_hotkey();
+            let screen_shot = windowisle::native::take_screenshot_hotkey();
+            let clipboard_win_v = self.input_keys.as_ref().is_some_and(|keys| keys.take_clipboard_hotkey());
+            let clipboard_hotkey = windowisle::native::take_clipboard_hotkey() || clipboard_win_v;
+            let command_hotkey = windowisle::native::take_command_hotkey();
+            let image_ocr = windowisle::native::take_ocr_hotkey();
+            let notification_hotkey = windowisle::native::take_notification_hotkey();
+            let scroll_hotkey = windowisle::native::take_scroll_hotkey();
+            let volume_up = windowisle::native::take_volume_up_hotkey();
+            let volume_down = windowisle::native::take_volume_down_hotkey();
+            let volume_mute = windowisle::native::take_volume_mute_hotkey();
+            let brightness_up = windowisle::native::take_brightness_up_hotkey();
+            let brightness_down = windowisle::native::take_brightness_down_hotkey();
+            if brightness_up || brightness_down {
+                self.brightness_step(if brightness_up {
+                    windowisle::brightness::STEP
+                } else {
+                    -windowisle::brightness::STEP
+                });
+            }
+            let media_play = windowisle::native::take_media_play_hotkey();
+            let media_next = windowisle::native::take_media_next_hotkey();
+            let media_prev = windowisle::native::take_media_prev_hotkey();
+            if media_play || media_next || media_prev {
+                if media_play {
+                    self.media_control(windowisle::smtc::Transport::Toggle, "播放 / 暂停");
+                } else if media_next {
+                    self.media_control(windowisle::smtc::Transport::Next, "下一首");
+                } else {
+                    self.media_control(windowisle::smtc::Transport::Prev, "上一首");
+                }
+            }
+            if volume_up || volume_down || volume_mute {
+                if volume_up {
+                    self.volume_step(windowisle::volume::STEP);
+                } else if volume_down {
+                    self.volume_step(-windowisle::volume::STEP);
+                } else {
+                    self.volume_toggle_mute();
+                }
+            }
+            if self.scroll_capture.is_some() {
+                if scroll_hotkey {
+                    self.finish_scroll_capture(ctx);
+                }
+            } else if scroll_hotkey {
+                self.start_region_scroll(ctx);
+            } else if screen_shot {
+                self.start_region_screenshot(ctx);
+            } else if screen_ocr {
+                self.start_region_ocr(ctx);
+            } else if !self.capture_overlay.open && !self.annotate.is_open() {
+                if clipboard_hotkey {
+                    if self.clipboard_popup.open {
+                        self.close_clipboard(true);
+                    } else {
+                        self.open_clipboard(ctx, true);
+                    }
+                }
+                if command_hotkey {
+                    if self.command_palette.is_open() {
+                        self.command_palette.close();
+                    } else {
+                        self.open_command_palette(ctx);
+                    }
+                }
+                if image_ocr {
+                    self.run_ocr(ctx);
+                }
+                if notification_hotkey {
+                    self.open_notifications(ctx);
+                }
+            }
+        }
+        self.poll_clipboard();
+        self.poll_ocr(ctx);
+        #[cfg(windows)]
+        if windowisle::native::take_foreground_change() {
+            // 切到别的程序：收起，并在光标离开前不再自动展开
+            self.app.foreground_changed();
+        }
+        if !self.placed {
+            if let Some(mon) = ctx.input(|i| i.viewport().monitor_size) {
+                self.placed = true;
+                self.win_x = ((mon.x - app::WIN_W) / 2.0).round();
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(self.win_x, 0.0)));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            }
+        }
+        #[cfg(windows)]
+        {
+            while let Ok(observation)=self.system_rx.try_recv(){
+                let next=observation.input;
+                let manual=next.is_some_and(|state|self.input_keys.as_ref().is_some_and(|keys|keys.allows(state.context)));
+                if let Some(label)=self.input_state.observe(next,manual){
+                    if let Some(keys)=&self.input_keys{keys.clear();}
+                    if self.app.settings.system_hud{self.app.alert("键盘输入语言",label,5,false);}
+                }
+                let new=observation.system;
+                // 切换输出设备时，系统会恢复该设备的音量；等待它稳定后再提示调节。
+                if new.audio_endpoint!=self.system_state.audio_endpoint {self.volume_quiet=PollClock::now();}
+                if self.app.settings.system_hud {
+                    for (title,body) in new.changes(&self.system_state) {
+                        // 拖动音量条刚改过音量时，系统回声不再单独弹一条。
+                        if title=="系统音量" && !self.volume_quiet.ready(Duration::from_millis(900)) { continue; }
+                        self.app.alert(title,body,5,false);
+                    }
+                }
+                self.system_state=new;
+                self.fullscreen=observation.fullscreen;
+            }
+            self.hidden=self.app.settings.hide_fullscreen&&self.fullscreen;
+            if let Some(rx)=&self.bt_rx {
+                while let Ok(found)=rx.try_recv(){ self.bt=found; self.bt_ready=true; }
+            }
+            if let Some(rx)=&self.incoming {
+                while let Ok(event)=rx.try_recv(){match event {windowisle::system::Incoming::Status(s)=>self.app.listener_status=s,windowisle::system::Incoming::Message(a,id,b)=>self.app.receive_notification(a,id,b)}}
+            }
+        }
+        let env = self.env(ctx);
+        // v0.5.5 邮件：开关 / 间隔 / 账号清单变了就重新对齐收信线程，再把事件交给界面。
+        let sig=(self.app.settings.mail_enabled,self.app.settings.mail_interval,self.app.mail_accounts().to_vec());
+        if sig!=self.mail_sig{
+            let accounts:&[windowisle::mail::Account]=if sig.0{ &sig.2 }else{ &[] };
+            self.mail.sync(accounts,sig.1);
+            self.mail_sig=sig;
+        }
+        while let Some(ev)=self.mail.try_recv(){self.app.mail_event(ev);}
+        // 日程连接或自动同步开关变化时下发给工作线程。
+        // 录制/截图演示用的是假账号，别让真服务去连（会立刻失败、把状态改成红色）。
+        #[cfg(feature="record")]
+        let cal_demo=std::env::var("WINDOWISLE_CAL_DEMO").is_ok();
+        #[cfg(not(feature="record"))]
+        let cal_demo=false;
+        let cal=if cal_demo{Vec::new()}else{self.app.calendar_configs()};
+        let auto_sync=self.app.settings.calendar_auto_sync;
+        if (&cal,auto_sync)!=(&self.cal_sig.0,self.cal_sig.1){
+            self.cal.configure(cal.clone(),auto_sync);
+            self.cal_sig=(cal,auto_sync);
+        }
+        while let Some(ev)=self.cal.try_recv(){self.app.calendar_event(ev);}
+        let weather_cfg=(self.app.settings.weather_enabled,self.app.weather_selected_city(),self.app.settings.weather_refresh_minutes);
+        if weather_cfg!=self.weather_sig {
+            self.weather.configure(weather_cfg.0,weather_cfg.1.clone(),weather_cfg.2);
+            self.weather_sig=weather_cfg;
+        }
+        while let Some(event)=self.weather.try_recv(){self.app.weather_event(event);}
+        // Agent 任务（DSH）：配置变化时下发；事件交给界面。
+        let dsh_cfg = self.app.dsh_config();
+        if self.dsh_sig.as_ref() != Some(&dsh_cfg) {
+            self.dsh.sync(dsh_cfg.clone());
+            self.dsh_sig = Some(dsh_cfg);
+        }
+        while let Some(event) = self.dsh.try_recv() {
+            self.app.dsh_event(event);
+        }
+        // 内存清理：开关 / 间隔 / 阈值 / 排除列表变化时重新下发调度配置。
+        let mem_sig=(
+            self.app.settings.mem_clean_enabled,
+            self.app.settings.mem_clean_interval_hours,
+            self.app.settings.mem_clean_free_threshold,
+            self.app.settings.mem_clean_exclusions.clone(),
+        );
+        if mem_sig!=self.mem_clean_sig{
+            self.mem_clean.reconfigure(mem_sig.0,mem_sig.1,mem_sig.2,&mem_sig.3);
+            self.mem_clean_sig=mem_sig;
+        }
+        while let Some(event)=self.mem_clean.try_recv(){
+            let was_connected=self.app.mem_connected();
+            self.app.mem_clean_event(event);
+            // 懒安装刚连上：自动补发被挂起的那次清理。
+            if !was_connected && self.app.mem_connected() && self.app.take_pending_clean(){
+                self.mem_clean.clean_now();
+            }
+        }
+        if self.app.settings.audio_visualizer != self.audio_visualizer {
+            self.audio_visualizer = self.app.settings.audio_visualizer;
+            self.audio = if self.audio_visualizer { Some(windowisle::audio::Service::start()) } else { None };
+        }
+        if let Some(service) = self.audio.as_ref() {
+            while let Some(event) = service.try_recv() {
+                match event {
+                    windowisle::audio::Event::Spectrum(spectrum) => self.app.audio_spectrum(spectrum),
+                    windowisle::audio::Event::Unavailable(message) => self.app.say(format!("音频可视化不可用：{message}")),
+                }
+            }
+        }
+        let remember_pins = self.app.settings.remember_pins;
+        if remember_pins != self.pins_persist_last {
+            if !remember_pins {
+                self.clear_pin_storage();
+            }
+            self.pins_persist_last = remember_pins;
+        }
+        let want_processes = self.app.process_page_active();
+        if want_processes && self.processes.is_none() {
+            self.processes = Some(windowisle::processes::Service::start());
+        } else if !want_processes {
+            self.processes = None;
+        }
+        if let Some(service) = self.processes.as_ref() {
+            while let Some(snapshot) = service.try_recv() {
+                self.app.processes_event(snapshot);
+            }
+        }
+        #[cfg(feature="record")] let quota_demo=std::env::var("WINDOWISLE_QUOTA_DEMO").is_ok();
+        #[cfg(not(feature="record"))] let quota_demo=false;
+        if !quota_demo {
+            let config=self.app.quota_config();let sig=(config.enabled,config.accounts.iter().cloned().map(|mut a|{a.alias.clear();a.pinned=false;a}).collect::<Vec<_>>());
+            if self.quota_sig.as_ref()!=Some(&sig) || self.quota_at.ready(Duration::from_secs(180)){
+                let accounts:Vec<_>=sig.1.iter().filter(|a|sig.0 && a.enabled).cloned().collect();
+                if self.quota.refresh(accounts.clone()){self.app.quota_pending(&accounts);self.quota_sig=Some(sig);self.quota_at=PollClock::now();}
+            }
+            while let Some(ev)=self.quota.try_recv(){self.app.quota_event(ev);}
+        }
+        let mut out = None;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(Color32::TRANSPARENT))
+            .show(ctx, |ui| {
+                let win = egui::Rect::from_min_size(ui.max_rect().min,egui::vec2(app::WIN_W,app::WIN_H));
+                out = Some(self.app.frame(ui, win, &env));
+            });
+        let Some(out) = out else { return };
+
+        #[cfg(windows)]
+        if let Some(native) = &mut self.native {
+            let r = |r: egui::Rect| (r.left(), r.top(), r.width(), r.height());
+            // 保留主窗口的事件循环，避免全屏隐藏后设置窗口无法关闭或重新打开。
+            let region=if self.hidden {(0.0,0.0,0.0,0.0)} else {r(out.region)};
+            let hit=if self.hidden {(0.0,0.0,0.0,0.0)} else {r(out.hit)};
+            native.update(region, hit, if self.hidden{None}else{out.notice_hit.map(r)},if self.hidden{None}else{out.file_drop_zone.map(r)},ctx.pixels_per_point(), out.editing, !self.hidden && out.expanded);
+        }
+        for cmd in out.cmds {
+            match cmd {
+                Cmd::Media(t) => {
+                    let source=self.media.lock().map(|media|media.source.clone()).unwrap_or_default();
+                    std::thread::spawn(move || smtc::control(t,&source));
+                }
+                Cmd::Open(p) => {if let Err(e)=open_path(&p){self.app.say(e);}},
+                Cmd::OpenUrl(url)=>{
+                    if let Some(url)=windowisle::mail::web_url(&url) {
+                        if open_path(std::path::Path::new(&url)).is_err(){self.app.say("无法打开默认浏览器，请检查 Windows 默认应用设置");}
+                    }
+                },
+                Cmd::OpenDsh=>{
+                    // 协议没注册（没装桌面版）时 ShellExecute 返回错误。
+                    if open_path(std::path::Path::new("dsh://open")).is_err(){self.app.say("没能打开 DeepSeek Harness，请确认已安装桌面版");}
+                },
+                Cmd::AddFiles=>{
+                    #[cfg(windows)] match windowisle::system::pick_files(){Ok(files)=>if !files.is_empty(){self.app.on_drop(files);self.app.show_page(3);},Err(e)=>self.app.say(format!("无法选择文件：{}",e.code()))}
+                },
+                Cmd::DragFile(p)=>{
+                    #[cfg(windows)] if let Err(e)=windowisle::system::drag_file(&p){self.app.say(format!("无法拖出文件：{}",e.code()));}
+                    ctx.input_mut(|i| i.pointer=Default::default());
+                },
+                Cmd::DisconnectNotifications=>{#[cfg(windows)]{self.incoming=None;self.app.settings.read_notifications=false;self.app.settings.save();self.app.listener_status="已断开，不再读取 Windows 通知".into();}},
+                Cmd::Reveal(p)=>{let _=std::process::Command::new("explorer.exe").arg(format!("/select,{}",p.display())).spawn();},
+                Cmd::QuotaChooseFile=>{
+                    #[cfg(windows)] match windowisle::system::pick_files_for("选择 AI 账号的登录 JSON 文件",false){Ok(files)=>if let Some(path)=files.into_iter().next(){self.app.quota_set_source(path);},Err(_)=>self.app.say("无法选择登录文件")}
+                },
+                Cmd::QuotaRefresh=>{
+                    if self.quota_at.ready(Duration::from_secs(15)) {
+                        let config=self.app.quota_config();let accounts:Vec<_>=config.accounts.iter().filter(|a|config.enabled && a.enabled).cloned().collect();
+                        if self.quota.refresh(accounts.clone()){self.app.quota_pending(&accounts);self.quota_at=PollClock::now();}
+                    }else{self.app.say("请稍后再刷新");}
+                },
+                Cmd::QuotaConnected=>{self.quota_sig=None;},
+                Cmd::ToggleAutostart=>{
+                    #[cfg(windows)] {let want=!self.autostart;match windowisle::tray::set_autostart(want){Ok(())=>self.autostart=want,Err(e)=>self.app.say(e)}}
+                },
+                Cmd::SetVolume(v)=>{
+                    #[cfg(windows)] windowisle::system::set_volume(v);
+                    self.volume_quiet=PollClock::now();
+                },
+                Cmd::ToggleMute=>{
+                    #[cfg(windows)] windowisle::system::toggle_mute();
+                    self.volume_quiet=PollClock::now();
+                },
+                Cmd::Copy(text)=>{ctx.copy_text(text);self.app.say("已复制");},
+                Cmd::Notify(title,body)=>{
+                    #[cfg(windows)] if let Some(tray)=&self.tray{tray.notify(&title,&body,self.app.settings.sound);}
+                },
+                Cmd::RequestNotifications=>{
+                    #[cfg(windows)] {self.app.settings.read_notifications=true;self.app.settings.save();self.incoming=None;match windowisle::system::connect(){Ok(rx)=>{self.incoming=Some(rx);self.app.listener_status="正在请求 Windows 通知权限…".into();},Err(e)=>self.app.listener_status=format!("Windows 未允许读取通知：{}。需要相应的系统权限或应用身份。",e.code())}}
+                },
+                Cmd::MailSync=>{
+                    let enabled=self.app.settings.mail_enabled;
+                    let accounts=if enabled{self.app.mail_accounts().to_vec()}else{Vec::new()};
+                    self.mail.sync(&accounts,self.app.settings.mail_interval);
+                    self.mail_sig=(enabled,self.app.settings.mail_interval,self.app.mail_accounts().to_vec());
+                },
+                Cmd::MailTest(account,password)=>self.mail.test(account,password),
+                Cmd::CalendarTest(cfg,password)=>self.cal.test(cfg,password),
+                Cmd::CalendarSync=>self.cal.sync_now(),
+                Cmd::CalendarMonth(month)=>self.cal.view_month(month),
+                Cmd::CalendarForget=>{
+                    if let Err(error)=windowisle::calendar::forget_config(){self.app.say(&error);continue;}
+                    if let Some(old)=self.app.forget_calendar(){windowisle::calendar::secrets::delete(&old);}
+                    let configs=self.app.calendar_configs();
+                    self.cal.configure(configs.clone(),self.app.settings.calendar_auto_sync);
+                    self.cal_sig=(configs,self.app.settings.calendar_auto_sync);
+                },
+                Cmd::Focus => ctx.send_viewport_cmd(egui::ViewportCommand::Focus),
+                Cmd::ClipboardClear => self.clipboard.clear(),
+                Cmd::WeatherRefresh => self.weather.refresh(),
+                Cmd::OpenNotifications => self.open_notifications(ctx),
+                Cmd::CleanMemory => self.clean_memory(),
+                Cmd::InstallCleanService => self.install_clean_service(),
+            }
+        }
+
+
+        #[cfg(windows)] let autostart = self.autostart;
+        #[cfg(not(windows))] let autostart = false;
+        self.app.settings_ui(ctx, autostart);
+        self.sync_clipboard_shortcut(ctx);
+        self.app.mail_reader_ui(ctx);
+        self.show_clipboard(ctx);
+        self.show_command_palette(ctx);
+        self.show_notifications(ctx);
+        self.show_capture_overlay(ctx);
+        self.show_scroll_capture(ctx);
+        self.show_annotate(ctx);
+        self.show_pins(ctx);
+        let media_state = self.media.lock().map(|media| media.clone()).unwrap_or_default();
+        self.media_hud.poll(ctx, media_state);
+        self.brightness_hud.poll(ctx);
+        #[cfg(windows)] let repaint_after=if self.hidden{Duration::from_secs(1)}else{out.repaint_after};
+        #[cfg(not(windows))] let repaint_after=out.repaint_after;
+        let repaint_after = if self.clipboard_popup.open || self.command_palette.is_open() || self.capture_overlay.open || self.notifications_popup.is_open() || self.annotate.is_open() || !self.pins.is_empty() || self.scroll_capture.is_some()  || self.media_hud.is_open() || self.brightness_hud.is_open() {
+            Duration::from_millis(16)
+        } else {
+            repaint_after
+        };
+        ctx.request_repaint_after(repaint_after);
+    }
+}
+
+// ---------------- 系统信息 ----------------
+
+#[cfg(windows)]
+fn local_now() -> (String, String, String) {
+    use windows::Win32::System::SystemInformation::GetLocalTime;
+    let st = unsafe { GetLocalTime() };
+    let wd = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+    (
+        format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond),
+        format!("{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay),
+        format!("{}月{}日 {}", st.wMonth, st.wDay, wd[(st.wDayOfWeek as usize).min(6)]),
+    )
+}
+
+#[cfg(not(windows))]
+fn local_now() -> (String, String, String) {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+    (format!("{h:02}:{m:02}:{s:02}"), "1970-01-01".into(), "1月1日 周四".into())
+}
+
+#[cfg(windows)]
+fn read_power() -> (Option<u8>, bool) {
+    use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+    let mut st = SYSTEM_POWER_STATUS::default();
+    if unsafe { GetSystemPowerStatus(&mut st) }.is_ok() {
+        let pct = if st.BatteryLifePercent == 255 { None } else { Some(st.BatteryLifePercent) };
+        (pct, st.ACLineStatus == 1)
+    } else {
+        (None, false)
+    }
+}
+
+#[cfg(not(windows))]
+fn read_power() -> (Option<u8>, bool) {
+    (None, true)
+}
+
+#[cfg(windows)]
+fn cursor_logical(ppp: f32) -> Option<(f32, f32)> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut p = POINT::default();
+    unsafe { GetCursorPos(&mut p) }.ok()?;
+    Some((p.x as f32 / ppp, p.y as f32 / ppp))
+}
+
+#[cfg(not(windows))]
+fn cursor_logical(_ppp: f32) -> Option<(f32, f32)> {
+    None
+}
+
+#[cfg(windows)]
+fn open_notification_source(source_id: &str) -> bool {
+    let source_id = source_id.trim();
+    if source_id.is_empty() {
+        return false;
+    }
+    if source_id.contains('\\') || source_id.to_ascii_lowercase().ends_with(".exe") {
+        return open_path(std::path::Path::new(source_id)).is_ok();
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let file: Vec<u16> = std::ffi::OsStr::new("explorer.exe")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let params: Vec<u16> = format!("shell:AppsFolder\\{source_id}")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let operation: Vec<u16> = "open\0".encode_utf16().collect();
+        unsafe {
+            ShellExecuteW(
+                None,
+                PCWSTR(operation.as_ptr()),
+                PCWSTR(file.as_ptr()),
+                PCWSTR(params.as_ptr()),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+            .0 as usize
+                > 32
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn open_path(p: &std::path::Path)->Result<(),String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let mut wide: Vec<u16> = p.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let op: Vec<u16> = "open\0".encode_utf16().collect();
+    unsafe {
+        let result=ShellExecuteW(None, PCWSTR(op.as_ptr()), PCWSTR(wide.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+        if result.0 as usize<=32 {return Err("无法打开，请检查文件位置和默认应用".into())}
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn open_path(_p: &std::path::Path)->Result<(),String> {Ok(())}
+
+fn main() -> std::process::ExitCode {
+    // 清理服务入口：windowisle.exe 兼任 SYSTEM 清理服务（SCM 以 --service-run
+    // 拉起复制到 Program Files 的副本；UAC 安装/卸载也走本程序）。命中时
+    // 不启动界面、不抢单实例互斥体。
+    #[cfg(windows)]
+    if let Some(code) = win_mem_cleaner::service_cli() {
+        return std::process::ExitCode::from(code.clamp(0, 255) as u8);
+    }
+    diagnostics::install();
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            diagnostics::report("窗屿启动或运行失败。", &error.to_string());
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> eframe::Result<()> {
+    // 架构反转（v0.6.50）：windowisle 主进程保持普通权限，内存清理由 SYSTEM
+    // 清理服务执行（命名管道通信，见 mem_clean.rs）。主进程不再 relaunch
+    // 提权——拖放、剪贴板等跨完整性交互全部恢复正常；清理服务的首次
+    // 安装在设置页里以一次 UAC 完成。
+    // 旧版「岛仔」还开着：两座岛会同时出现，旧版也占着数据目录，迁移做不成。
+    #[cfg(windows)]
+    if windowisle::tray::legacy_instance_running() {
+        diagnostics::notice("检测到旧版「岛仔」正在运行。\n\n请先右键托盘里的岛仔图标，选择「退出」，再打开窗屿。岛仔的设置、记录和已保存的授权码会自动迁移到窗屿。");
+        return Ok(());
+    }
+    // 单实例
+    #[cfg(windows)]
+    if !windowisle::tray::single_instance() {
+        if std::env::args().any(|arg|arg=="--settings"){windowisle::tray::open_settings();}
+        if std::env::args().any(|arg|arg=="--calendar"){windowisle::tray::open_calendar();}
+        return Ok(());
+    }
+    // 改名迁移：必须在读任何设置之前。迁移失败时旧数据原样保留，不启动，
+    // 免得新版写出空数据目录后再也迁移不了。
+    let migrated = match windowisle::legacy::migrate_app_data() {
+        Some(Err(error)) => {
+            diagnostics::notice(&format!("{error}\n\n窗屿没有改动旧数据。请确认「岛仔」已完全退出，再重新打开窗屿。"));
+            return Ok(());
+        }
+        Some(Ok(())) => true,
+        None => false,
+    };
+    #[cfg(windows)]
+    windowisle::tray::migrate_legacy_autostart();
+    let viewport = egui::ViewportBuilder::default()
+        .with_title("窗屿").with_icon(windowisle::theme::app_icon())
+        .with_inner_size([app::CANVAS_W, app::WIN_H])
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_active(false)
+        .with_resizable(false)
+        .with_taskbar(false)
+        .with_always_on_top()
+        .with_visible(false);
+    let opts = eframe::NativeOptions { viewport, vsync: !cfg!(windows), ..Default::default() };
+    eframe::run_native("窗屿", opts, Box::new(move |cc| Ok(Box::new(Shell::new(cc, migrated)))))
+}
+impl Drop for Shell {
+    fn drop(&mut self) {
+        if self.app.settings.remember_pins {
+            let records: Vec<_> = self
+                .pins
+                .iter()
+                .filter_map(|pin| pin.metadata())
+                .collect();
+            let _ = windowisle::pin_store::save_records(&records);
+        }
+    }
+}

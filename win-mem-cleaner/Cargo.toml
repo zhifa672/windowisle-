@@ -1,0 +1,35 @@
+[package]
+name = "win-mem-cleaner"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+description = "Windows 内存清理库：手动清理、定时清理、可用内存低于阈值自动清理（移植自 WinMemoryCleaner）"
+repository = "https://github.com/IgorMundstein/WinMemoryCleaner"
+publish = false
+
+# 与 jilespace-daozai 使用相同的 windows crate 版本，接入时依赖可直接合并。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Registry",
+    "Win32_System_Pipes",
+    "Win32_System_Services",
+    "Win32_System_RemoteDesktop",
+    "Win32_Security_Authorization",
+    "Win32_UI_Shell",
+] }
+
+[dependencies]
+# 仅用于提权 helper 与父进程之间的 JSON 线格式（公共 API 不暴露 serde 类型）。
+serde_json = "1"
+
+[dev-dependencies]
